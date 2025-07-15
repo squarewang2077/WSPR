@@ -1,4 +1,4 @@
-# Ignore files and directories that should not be tracked by Git
+# Ignore files that should not be tracked by Git
 # Those are large files which is not needed to be tracked by git
 
 dataset/*
