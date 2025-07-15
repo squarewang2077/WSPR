@@ -6,7 +6,3 @@ log/*
 model_zoo/*
 tmp/*
 
-!dataset/.gitkeep
-!log/.gitkeep
-!model_zoo/.gitkeep
-!tmp/.gitkeep
