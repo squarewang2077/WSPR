@@ -17,7 +17,7 @@ os.makedirs(log_dir, exist_ok=True)
 num_epochs = 20
 batch_size = 512
 learning_rate = 0.001
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 
 # Data transforms
 transform_train = transforms.Compose([
@@ -41,6 +41,7 @@ testloader = torch.utils.data.DataLoader(testset, batch_size=100, shuffle=False,
 # Model
 # net = torchvision.models.resnet18(weights=None, num_classes=10)
 net = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.DEFAULT)  
+net.fc = nn.Linear(net.fc.in_features, 10)  # Modify the final layer for CIFAR-10
 net = net.to(device)
 
 # Loss and optimizer
