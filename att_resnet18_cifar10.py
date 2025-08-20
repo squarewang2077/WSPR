@@ -72,8 +72,8 @@ out = nattack(
     net, testloader,
     fraction=0.1, # ≈ 10% of samples
     device=None,
-    save_perturbations=False,
-    N_noise=300, sigma=0.1, \
+    save_perturbations=True,
+    N=300, sigma=0.1, \
     att_type="infty", epsi=0.031, \
     N_step=500, step_size=0.02, reward_scaling=0.5, \
     img_mean = [0.4914, 0.4822, 0.4465], img_std = [0.2023, 0.1994, 0.2010]
