@@ -1,3 +1,6 @@
 [submodule "Nattack"]
 	path = Nattack
 	url = git@github.com:squarewang2077/Nattack.git
+[submodule "FrEIA"]
+	path = FrEIA
+	url = git@github.com:squarewang2077/AdvFlow.git
