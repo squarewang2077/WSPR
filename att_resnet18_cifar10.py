@@ -72,7 +72,7 @@ out = nattack(
     net, testloader,
     fraction=0.1, # ≈ 10% of samples
     device=None,
-    save_perturbations=True,
+    save_perturbations=False,
     N=300, sigma=0.1, \
     att_type="infty", epsi=0.031, \
     N_step=500, step_size=0.02, reward_scaling=0.5, \
