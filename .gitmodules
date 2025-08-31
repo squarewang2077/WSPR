@@ -7,3 +7,6 @@
 [submodule "advflow"]
 	path = advflow
 	url = git@github.com:squarewang2077/AdvFlow.git
+[submodule "torch-reparametrised-mixture-distribution"]
+	path = torch-reparametrised-mixture-distribution
+	url = git@github.com:squarewang2077/torch-reparametrised-mixture-distribution.git
