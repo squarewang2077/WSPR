@@ -4,3 +4,6 @@
 [submodule "FrEIA"]
 	path = FrEIA
 	url = git@github.com:squarewang2077/FrEIA.git
+[submodule "advflow"]
+	path = advflow
+	url = git@github.com:squarewang2077/AdvFlow.git
