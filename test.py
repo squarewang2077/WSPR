@@ -108,8 +108,9 @@ def prattack(
     device = next(model.parameters()).device if next(model.parameters(), None) else (x.device if x.is_cuda else 'cpu')
     model.eval()
 
-    x = x.to(device)
-    y = y.to(device)
+    for x, y, _ in dataloader:
+        x = x.to(device)
+        y = y.to(device)
 
     N = x.size(0)
     d = x[0].numel()
