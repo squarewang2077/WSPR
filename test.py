@@ -1,452 +1,232 @@
-
-from math import prod
-import warnings
-
 import torch
-import torch.distributions as distr
 import torch.nn.functional as F
-from torch.autograd.functional import jacobian
-# from torch.distributions.distribution import MixtureSameFamily
+import torch.distributions as D
 
-from torch.distributions.distribution import Distribution
-from torch.distributions import Categorical
-from torch.distributions import constraints
-from typing import Dict
+from irt.distributions import ReparametrizedMixtureSameFamily
+from normal import StableNormal
 
 
-class MixtureSameFamily(Distribution):
-    r"""
-    The `MixtureSameFamily` distribution implements a (batch of) mixture
-    distribution where all component are from different parameterizations of
-    the same distribution type. It is parameterized by a `Categorical`
-    "selecting distribution" (over `k` component) and a component
-    distribution, i.e., a `Distribution` with a rightmost batch shape
-    (equal to `[k]`) which indexes each (batch of) component.
+# --------------- Lp mapping into the admissible set B -----------------
 
-    Copied from PyTorch 1.8, so that it can be used with earlier PyTorch versions.
+def map_to_linf_ball(eps, gamma):
+    # elementwise clipping (box projection)
+    return torch.clamp(eps, -gamma, gamma)
 
-    Examples::
+def map_to_l2_ball(eps, gamma, eps_min=1e-12):
+    # project each vector in eps onto L2 ball of radius gamma
+    flat = eps.view(eps.shape[:-1] + (-1,))              # [..., d]
+    norms = flat.norm(p=2, dim=-1, keepdim=True).clamp_min(eps_min)
+    scale = torch.minimum(torch.ones_like(norms), gamma / norms)
+    flat = flat * scale
+    return flat.view_as(eps)
 
-        # Construct Gaussian Mixture Model in 1D consisting of 5 equally
-        # weighted normal distributions
-        >>> mix = D.Categorical(torch.ones(5,))
-        >>> comp = D.Normal(torch.randn(5,), torch.rand(5,))
-        >>> gmm = MixtureSameFamily(mix, comp)
 
-        # Construct Gaussian Mixture Modle in 2D consisting of 5 equally
-        # weighted bivariate normal distributions
-        >>> mix = D.Categorical(torch.ones(5,))
-        >>> comp = D.Independent(D.Normal(
-                     torch.randn(5,2), torch.rand(5,2)), 1)
-        >>> gmm = MixtureSameFamily(mix, comp)
+# --------------- θ: K-component factorized Gaussian mixture ------------
 
-        # Construct a batch of 3 Gaussian Mixture Models in 2D each
-        # consisting of 5 random weighted bivariate normal distributions
-        >>> mix = D.Categorical(torch.rand(3,5))
-        >>> comp = D.Independent(D.Normal(
-                    torch.randn(3,5,2), torch.rand(3,5,2)), 1)
-        >>> gmm = MixtureSameFamily(mix, comp)
+class ThetaGMM(torch.nn.Module):
+    """
+    Factorized (diagonal) K-component mixture over R^d, with batch-size B
+    (one θ per example when B == N, or shared θ when B == 1).
+    Uses StableNormal + Independent + ReparametrizedMixtureSameFamily.
+    """
+    def __init__(self, B, K, d, init_scale=0.1, device=None):
+        super().__init__()
+        self.B, self.K, self.d = B, K, d
+        device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.mix_logits = torch.nn.Parameter(torch.zeros(B, K, device=device))
+        self.loc        = torch.nn.Parameter(torch.zeros(B, K, d, device=device))
+        # parameterize scale via softplus for positivity
+        rho0 = torch.log(torch.exp(torch.tensor(init_scale, device=device)) - 1.0)
+        self.rho        = torch.nn.Parameter(rho0.expand(B, K, d).clone())
 
+    def distribution(self):
+        mix = D.Categorical(logits=self.mix_logits)                # [B, K]
+        scale = F.softplus(self.rho) + 1e-6                        # [B, K, d]
+        base = StableNormal(loc=self.loc, scale=scale)             # univariate across d
+        comp = D.Independent(base, 1)                              # event_shape=(d,)
+        return ReparametrizedMixtureSameFamily(mix, comp)
+
+    @torch.no_grad()
+    def freeze_small_scales(self, min_scale=1e-5):
+        # (optional) keep scales from collapsing to zero
+        self.rho.data = torch.maximum(self.rho.data,
+                                      torch.log(torch.exp(torch.tensor(min_scale, device=self.rho.device)) - 1.0))
+
+
+# --------------- Core: learn θ to minimize WSPR (maximize loss) --------
+
+def optimize_theta_pr_attack(
+    model,
+    x, y,
+    gamma=0.5,
+    norm="linf",          # "linf" or "l2"
+    K=3,
+    steps=200,
+    S=64,                 # MC samples per step
+    lr=5e-2,
+    targeted=None,        # None for untargeted; or target class int (or tensor of shape [N])
+    shared_theta=False,   # if True, share one θ across the batch
+    entropy_reg=0.0,      # small positive (e.g., 1e-3) can stabilize mixture weights
+    clamp01=True          # clamp images to [0,1]
+):
+    """
     Args:
-        mixture_distribution: `torch.distributions.Categorical`-like
-            instance. Manages the probability of selecting component.
-            The number of categories must match the rightmost batch
-            dimension of the `component_distribution`. Must have either
-            scalar `batch_shape` or `batch_shape` matching
-            `component_distribution.batch_shape[:-1]`
-        component_distribution: `torch.distributions.Distribution`-like
-            instance. Right-most batch dimension indexes component.
+      model: classifier returning logits.
+      x: input batch [N, C, H, W]
+      y: true labels [N]
+      gamma, norm: perturbation budget.
+      targeted: None for untargeted, or an int / LongTensor with target class(es).
+      shared_theta: share θ across the whole batch (B=1) or per-example θ (B=N).
+    Returns:
+      theta: learned ThetaGMM
+      wspr_hat: Monte-Carlo estimate of WSPR after optimization
     """
-    arg_constraints: Dict[str, constraints.Constraint] = {}
-    has_rsample = False
+    device = next(model.parameters()).device if next(model.parameters(), None) else (x.device if x.is_cuda else 'cpu')
+    model.eval()
 
-    def __init__(self,
-                 mixture_distribution,
-                 component_distribution,
-                 validate_args=None):
-        self._mixture_distribution = mixture_distribution
-        self._component_distribution = component_distribution
+    x = x.to(device)
+    y = y.to(device)
 
-        if not isinstance(self._mixture_distribution, Categorical):
-            raise ValueError(" The Mixture distribution needs to be an "
-                             " instance of torch.distribtutions.Categorical")
+    N = x.size(0)
+    d = x[0].numel()
 
-        if not isinstance(self._component_distribution, Distribution):
-            raise ValueError("The Component distribution need to be an "
-                             "instance of torch.distributions.Distribution")
+    B = 1 if shared_theta else N
+    theta = ThetaGMM(B=B, K=K, d=d, device=device).to(device)
+    opt = torch.optim.Adam(theta.parameters(), lr=lr)
 
-        # Check that batch size matches
-        mdbs = self._mixture_distribution.batch_shape
-        cdbs = self._component_distribution.batch_shape[:-1]
-        for size1, size2 in zip(reversed(mdbs), reversed(cdbs)):
-            if size1 != 1 and size2 != 1 and size1 != size2:
-                raise ValueError("`mixture_distribution.batch_shape` ({0}) is not "
-                                 "compatible with `component_distribution."
-                                 "batch_shape`({1})".format(mdbs, cdbs))
+    # label setup
+    if targeted is None:
+        # untargeted: increase CE wrt true labels (i.e., minimize correctness)
+        target_labels = y
+    else:
+        if isinstance(targeted, int):
+            target_labels = torch.full_like(y, fill_value=targeted, device=device)
+        else:
+            target_labels = torch.as_tensor(targeted, device=device, dtype=y.dtype)
 
-        # Check that the number of mixture component matches
-        km = self._mixture_distribution.logits.shape[-1]
-        kc = self._component_distribution.batch_shape[-1]
-        if km is not None and kc is not None and km != kc:
-            raise ValueError("`mixture_distribution component` ({0}) does not"
-                             " equal `component_distribution.batch_shape[-1]`"
-                             " ({1})".format(km, kc))
-        self._num_component = km
+    # helper to map eps to budget
+    map_B = (map_to_linf_ball if norm == "linf" else map_to_l2_ball)
 
-        event_shape = self._component_distribution.event_shape
-        self._event_ndims = len(event_shape)
-        super(MixtureSameFamily, self).__init__(batch_shape=cdbs,
-                                                event_shape=event_shape,
-                                                validate_args=validate_args)
+    for t in range(steps):
+        opt.zero_grad(set_to_none=True)
 
-    def expand(self, batch_shape, _instance=None):
-        batch_shape = torch.Size(batch_shape)
-        batch_shape_comp = batch_shape + (self._num_component,)
-        new = self._get_checked_instance(MixtureSameFamily, _instance)
-        new._component_distribution = \
-            self._component_distribution.expand(batch_shape_comp)
-        new._mixture_distribution = \
-            self._mixture_distribution.expand(batch_shape)
-        new._num_component = self._num_component
-        new._event_ndims = self._event_ndims
-        event_shape = new._component_distribution.event_shape
-        super(MixtureSameFamily, new).__init__(batch_shape=batch_shape,
-                                               event_shape=event_shape,
-                                               validate_args=False)
-        new._validate_args = self._validate_args
-        return new
+        dist = theta.distribution()
+        # Sample eps: [S, B, d]; broadcast to [S, N, d] if shared theta
+        eps = dist.rsample(sample_shape=(S,))                     # [S, B, d]
+        if shared_theta:
+            eps = eps.expand(-1, N, -1).contiguous()              # [S, N, d]
 
-    @constraints.dependent_property
-    def support(self):
-        # FIXME this may have the wrong shape when support contains batched
-        # parameters
-        return self._component_distribution.support
+        # map into B (L_p ball)
+        eps = map_B(eps, gamma=gamma)                             # [S, N, d]
 
-    @property
-    def mixture_distribution(self):
-        return self._mixture_distribution
+        # build perturbed inputs
+        x_flat = x.view(N, -1)                                    # [N, d]
+        x_pert = (x_flat.unsqueeze(0) + eps).view((S,) + x.shape) # [S, N, C, H, W]
+        if clamp01:
+            x_pert = torch.clamp(x_pert, 0.0, 1.0)
 
-    @property
-    def component_distribution(self):
-        return self._component_distribution
+        # forward
+        logits = model(x_pert.view(-1, *x.shape[1:]))             # [S*N, C_classes]
+        if targeted is None:
+            # untargeted: CE wrt true label (maximize loss)
+            labels = y.repeat(S)
+            loss = F.cross_entropy(logits, labels, reduction='mean')
+        else:
+            # targeted: CE wrt target label (minimize it to push toward target)
+            labels = target_labels.repeat(S)
+            loss = F.cross_entropy(logits, labels, reduction='mean')
 
-    @property
-    def mean(self):
-        probs = self._pad_mixture_dimensions(self.mixture_distribution.probs)
-        return torch.sum(probs * self.component_distribution.mean,
-                         dim=-1 - self._event_ndims)  # [B, E]
+        # entropy regularizer on mixture weights (optional)
+        if entropy_reg > 0.0:
+            probs = F.softmax(theta.mix_logits, dim=-1)           # [B, K]
+            ent = -(probs * (probs.clamp_min(1e-12)).log()).sum(dim=-1).mean()
+            loss = loss - entropy_reg * ent
 
-    @property
-    def variance(self):
-        # Law of total variance: Var(Y) = E[Var(Y|X)] + Var(E[Y|X])
-        probs = self._pad_mixture_dimensions(self.mixture_distribution.probs)
-        mean_cond_var = torch.sum(probs * self.component_distribution.variance,
-                                  dim=-1 - self._event_ndims)
-        var_cond_mean = torch.sum(probs * (self.component_distribution.mean -
-                                           self._pad(self.mean)).pow(2.0),
-                                  dim=-1 - self._event_ndims)
-        return mean_cond_var + var_cond_mean
+        # We want worst-case θ:
+        # - Untargeted: maximize CE wrt true labels  -> descend on -loss
+        # - Targeted:   minimize CE wrt target label -> descend on +loss
+        obj = (-loss) if targeted is None else (loss)
+        obj.backward()
+        opt.step()
 
-    def cdf(self, x):
-        x = self._pad(x)
-        cdf_x = self.component_distribution.cdf(x)
-        mix_prob = self.mixture_distribution.probs
+        if (t + 1) % max(1, steps // 10) == 0:
+            with torch.no_grad():
+                pred = logits.argmax(dim=1)
+                acc = (pred == labels).float().mean().item()
+            if targeted is None:
+                print(f"[{t+1:4d}/{steps}] loss={loss.item():.4f}  CE↑ acc_under_dist={acc:.3f}")
+            else:
+                print(f"[{t+1:4d}/{steps}] loss={loss.item():.4f}  CE↓ target_acc={acc:.3f}")
 
-        return torch.sum(cdf_x * mix_prob, dim=-1)
+        theta.freeze_small_scales()
 
-    def log_prob(self, x):
-        if self._validate_args:
-            self._validate_sample(x)
-        x = self._pad(x)
-        log_prob_x = self.component_distribution.log_prob(x)  # [S, B, k]
-        log_mix_prob = torch.log_softmax(self.mixture_distribution.logits,
-                                         dim=-1)  # [B, k]
-        return torch.logsumexp(log_prob_x + log_mix_prob, dim=-1)  # [S, B]
+    # Monte-Carlo WSPR estimate after training θ
+    with torch.no_grad():
+        wspr_hat = estimate_wspr(model, x, y, theta, gamma=gamma, norm=norm, S=max(2048//max(1,N), 256), clamp01=clamp01)
 
-    def sample(self, sample_shape=torch.Size()):
-        with torch.no_grad():
-            sample_len = len(sample_shape)
-            batch_len = len(self.batch_shape)
-            gather_dim = sample_len + batch_len
-            es = self.event_shape
-
-            # mixture samples [n, B]
-            mix_sample = self.mixture_distribution.sample(sample_shape)
-            mix_shape = mix_sample.shape
-
-            # component samples [n, B, k, E]
-            comp_samples = self.component_distribution.sample(sample_shape)
-
-            # Gather along the k dimension
-            mix_sample_r = mix_sample.reshape(
-                mix_shape + torch.Size([1] * (len(es) + 1)))
-            mix_sample_r = mix_sample_r.repeat(
-                torch.Size([1] * len(mix_shape)) + torch.Size([1]) + es)
-
-            samples = torch.gather(comp_samples, gather_dim, mix_sample_r)
-            return samples.squeeze(gather_dim)
-
-    def _pad(self, x):
-        return x.unsqueeze(-1 - self._event_ndims)
-
-    def _pad_mixture_dimensions(self, x):
-        dist_batch_ndims = self.batch_shape.numel()
-        cat_batch_ndims = self.mixture_distribution.batch_shape.numel()
-        pad_ndims = 0 if cat_batch_ndims == 1 else \
-            dist_batch_ndims - cat_batch_ndims
-        xs = x.shape
-        x = x.reshape(xs[:-1] + torch.Size(pad_ndims * [1]) +
-                      xs[-1:] + torch.Size(self._event_ndims * [1]))
-        return x
-
-    def __repr__(self):
-        args_string = '\n  {},\n  {}'.format(self.mixture_distribution,
-                                             self.component_distribution)
-        return 'MixtureSameFamily' + '(' + args_string + ')'
+    return theta, wspr_hat
 
 
-class ReparametrizedMixtureSameFamily(MixtureSameFamily):
+# ---------------------- WSPR estimator --------------------------------
+
+@torch.no_grad()
+def estimate_wspr(model, x, y, theta, gamma=0.5, norm="linf", S=1024, clamp01=True):
     """
-    Adds rsample method to the MixtureSameFamily class
-    that implements implicit reparametrization.
+    Returns MC estimate of WSPR = P_{ε~ωθ}[ f(x+ε) = y ]
     """
-    has_rsample = True
-    
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    device = x.device
+    N = x.size(0)
+    d = x[0].numel()
 
-        if not self._component_distribution.has_rsample:
-            raise ValueError('Cannot reparameterize a mixture of non-reparameterizable components.')
+    dist = theta.distribution()
+    eps = dist.rsample(sample_shape=(S,))                         # [S, B, d]
+    if theta.B == 1:
+        eps = eps.expand(-1, N, -1).contiguous()                  # [S, N, d]
+    eps = map_to_linf_ball(eps, gamma) if norm == "linf" else map_to_l2_ball(eps, gamma)
 
-        # NOTE: Not necessary for implicit reparametrisation.
-        if not callable(getattr(self._component_distribution, '_log_cdf', None)):
-            warnings.warn(message=('The component distributions do not have numerically stable '
-                                   '`_log_cdf`, will use torch.log(cdf) instead, which may not '
-                                   'be stable. NOTE: this will not affect implicit reparametrisation.'),
-                        )
+    x_flat = x.view(N, -1)
+    x_pert = (x_flat.unsqueeze(0) + eps).view((S,) + x.shape)
+    if clamp01:
+        x_pert = torch.clamp(x_pert, 0.0, 1.0)
 
-    def rsample(self, sample_shape=torch.Size()):
-        """Adds reparameterization (pathwise) gradients to samples of the mixture.
-        
-        Based on Tensorflow Probability implementation
-        https://github.com/tensorflow/probability/blob/v0.12.2/tensorflow_probability/python/distributions/mixture_same_family.py#L433-L498
-
-        Implicit reparameterization gradients are
-
-        .. math::
-            dx/dphi = -(d transform(x, phi) / dx)^-1 * d transform(x, phi) / dphi,
-
-        where transform(x, phi) is distributional transform that removes all
-        parameters from samples x.
-
-        We implement them by replacing x with
-        -stop_gradient(d transform(x, phi) / dx)^-1 * transform(x, phi)]
-        for the backward pass (gradient computation).
-        The derivative of this quantity w.r.t. phi is then the implicit
-        reparameterization gradient.
-        Note that this replaces the gradients w.r.t. both the mixture
-        distribution parameters and components distributions parameters.
-
-        Limitations:
-        1. Fundamental: components must be fully reparameterized.
-        2. Distributional transform is currently only implemented for
-            factorized components.
-
-        Args:
-            x: Sample of mixture distribution
-
-        Returns:
-            Tensor with same value as x, but with reparameterization gradients
-        """
-        x = self.sample(sample_shape=sample_shape)
-        if not torch.is_grad_enabled():
-            return x
-
-        event_size = prod(self.event_shape)
-        if event_size != 1:
-            # Multivariate case
-            x_2d_shape = (-1, event_size)
-
-            # Perform distributional transform of x in [S, B, E] shape,
-            # but have Jacobian of size [S*prod(B), prod(E), prod(E)].
-            def reshaped_distributional_transform(x_2d):
-                return torch.reshape(
-                        self._distributional_transform(x_2d.reshape(x.shape)),
-                        x_2d_shape)
-                
-            x_2d = x.reshape(x_2d_shape)
-            
-            # Compute transform (the gradients of this transform will be computed using autodiff)
-            # transform_2d: [S*prod(B), prod(E)]
-            transform_2d = reshaped_distributional_transform(x_2d)
-            
-            # Compute the Jacobian of the distributional transform
-            def batched_jacobian_of_reshaped_distributional_transform(x_2d):
-                # Used to compute the batched Jacobian for a function that takes a (B, N) and produces (B, M). 
-                # NOTE: the function must be independent for each element in B. Otherwise, this would be incorrect.
-                # See: https://pytorch.org/functorch/1.13/notebooks/jacobians_hessians.html#batch-jacobian-and-batch-hessian
-                def reshaped_distributional_transform_summed(x_2d):
-                    return torch.sum(
-                            reshaped_distributional_transform(x_2d),
-                            dim=0)
-                return jacobian(reshaped_distributional_transform_summed, x_2d).detach().movedim(1, 0)
-            # jacobian: [S*prod(B), prod(E), prod(E)]
-            jac = batched_jacobian_of_reshaped_distributional_transform(x_2d)
-
-            # We only provide the first derivative; the second derivative computed by
-            # autodiff would be incorrect, so we raise an error if it is requested.
-            # TODO: prevent 2nd derivative of transform_2d.
-
-            # Compute [- stop_gradient(jacobian)^-1 * transform] by solving a linear
-            # system. The Jacobian is lower triangular because the distributional
-            # transform for i-th event dimension does not depend on the next
-            # dimensions.
-            surrogate_x_2d = -torch.triangular_solve(transform_2d[..., None], jac.detach(), upper=False)[0]
-            surrogate_x = surrogate_x_2d.reshape(x.shape)
-        else:
-            # For univariate distributions the Jacobian/derivative of the transformation is the
-            # density, so the computation is much cheaper.
-            transform = self._distributional_transform(x)
-            log_prob_x = self.log_prob(x)
-            
-            if self._event_ndims > 1:
-                log_prob_x = log_prob_x.reshape(log_prob_x.shape + (1,)*self._event_ndims)
-
-            surrogate_x = -transform*torch.exp(-log_prob_x.detach())
-
-        # Replace gradients of x with gradients of surrogate_x, but keep the value.
-        return x + (surrogate_x - surrogate_x.detach())
-
-    def _distributional_transform(self, x):
-        """Performs distributional transform of the mixture samples.
-
-        Based on Tensorflow Probability implementation
-        https://github.com/tensorflow/probability/blob/v0.12.2/tensorflow_probability/python/distributions/mixture_same_family.py#L500-L574
-
-        Distributional transform removes the parameters from samples of a
-        multivariate distribution by applying conditional CDFs:
-
-        .. math::
-            (F(x_1), F(x_2 | x1_), ..., F(x_d | x_1, ..., x_d-1))
-
-        (the indexing is over the 'flattened' event dimensions).
-        The result is a sample of product of Uniform[0, 1] distributions.
-
-        We assume that the components are factorized, so the conditional CDFs become
-
-        .. math::
-          `F(x_i | x_1, ..., x_i-1) = sum_k w_i^k F_k (x_i),`
-
-        where :math:`w_i^k` is the posterior mixture weight: for :math:`i > 0`
-        :math:`w_i^k = w_k prob_k(x_1, ..., x_i-1) / sum_k' w_k' prob_k'(x_1, ..., x_i-1)`
-        and :math:`w_0^k = w_k` is the mixture probability of the k-th component.
-
-        Args:
-            x: Sample of mixture distribution
-
-        Returns:
-            Result of the distributional transform
-        """
-        # Obtain factorized components distribution and assert that it's
-        # a scalar distribution.
-        if isinstance(self._component_distribution, distr.Independent):
-            univariate_components = self._component_distribution.base_dist
-        else:
-            univariate_components = self._component_distribution
-
-        # Expand input tensor and compute log-probs in each component
-        x = self._pad(x)  # [S, B, 1, E]
-        # NOTE: Only works with fully-factorised distributions!
-        log_prob_x = univariate_components.log_prob(x)  # [S, B, K, E]
-        
-        event_size = prod(self.event_shape)
-        if event_size != 1:
-            # Multivariate case
-            # Compute exclusive cumulative sum
-            # log prob_k (x_1, ..., x_i-1)
-            cumsum_log_prob_x = log_prob_x.reshape(-1, event_size)  # [S*prod(B)*K, prod(E)]
-            cumsum_log_prob_x = torch.cumsum(cumsum_log_prob_x, dim=-1)
-            cumsum_log_prob_x = cumsum_log_prob_x.roll(1, -1)
-            cumsum_log_prob_x[:, 0] = 0
-            cumsum_log_prob_x = cumsum_log_prob_x.reshape(log_prob_x.shape)
-
-            logits_mix_prob = self._pad_mixture_dimensions(self._mixture_distribution.logits)
-
-            # Logits of the posterior weights: log w_k + log prob_k (x_1, ..., x_i-1)
-            log_posterior_weights_x = logits_mix_prob + cumsum_log_prob_x
-            
-            # Normalise posterior weights
-            component_axis = -self._event_ndims-1
-            posterior_weights_x = torch.softmax(log_posterior_weights_x, dim=component_axis)
-
-            cdf_x = univariate_components.cdf(x)  # [S, B, K, E]
-            return torch.sum(posterior_weights_x * cdf_x, dim=component_axis)
-        else:
-            # For univariate distributions logits of the posterior weights = log w_k
-            log_posterior_weights_x = self._mixture_distribution.logits
-            posterior_weights_x = torch.softmax(log_posterior_weights_x, dim=-1)
-            posterior_weights_x = self._pad_mixture_dimensions(posterior_weights_x)
-
-            cdf_x = univariate_components.cdf(x)  # [S, B, K, E]
-            component_axis = -self._event_ndims-1
-            return torch.sum(posterior_weights_x * cdf_x, dim=component_axis)
+    logits = model(x_pert.view(-1, *x.shape[1:]))                 # [S*N, C]
+    pred = logits.argmax(dim=1).view(S, N)
+    corr = (pred == y.view(1, N).expand(S, N)).float().mean().item()
+    return corr
 
 
-    def _log_cdf(self, x):
-        x = self._pad(x)
-        if callable(getattr(self._component_distribution, '_log_cdf', None)):
-            log_cdf_x = self.component_distribution._log_cdf(x)
-        else:
-            # NOTE: This may be unstable
-            log_cdf_x = torch.log(self.component_distribution.cdf(x))
-
-        if isinstance(self.component_distribution, (distr.Bernoulli, distr.Binomial, distr.ContinuousBernoulli, 
-                                                    distr.Geometric, distr.NegativeBinomial, distr.RelaxedBernoulli)):
-            log_mix_prob = torch.sigmoid(self.mixture_distribution.logits)
-        else:
-            log_mix_prob = F.log_softmax(self.mixture_distribution.logits, dim=-1)
-
-        return torch.logsumexp(log_cdf_x + log_mix_prob, dim=-1)
-
-
+# ---------------------- Example usage ---------------------------------
 if __name__ == "__main__":
-    from normal import StableNormal
-    from math import prod
+    # toy example (replace with your real model/x/y)
+    class TinyNet(torch.nn.Module):
+        def __init__(self, C=1, num_classes=10):
+            super().__init__()
+            self.net = torch.nn.Sequential(
+                torch.nn.Flatten(),
+                torch.nn.Linear(C*28*28, 128),
+                torch.nn.ReLU(),
+                torch.nn.Linear(128, num_classes),
+            )
+        def forward(self, z): return self.net(z)
 
-    dims = (2, 4)
-    torch.manual_seed(1111)
-    mixture_probs=torch.softmax(torch.randn(*dims), dim=-1)
-    # mixture_probs=torch.softmax(torch.randn(dims[0]), dim=-1)
-    locs = torch.arange(prod(dims)).float().reshape(*dims)
-    stds = torch.abs(torch.randn(*dims))*3
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = TinyNet(C=1).to(device).eval()
 
-    # Make sure with and without event dim we get the same result
-    mixture = distr.Categorical(probs=mixture_probs)
-    components = StableNormal(loc=locs, scale=stds)
-    mog = ReparametrizedMixtureSameFamily(mixture_distribution=mixture,
-                                          component_distribution=components)
-    extra_ndims = 2
-    components2 = StableNormal(loc=locs.reshape(locs.shape + (1,)*extra_ndims), 
-                               scale=stds.reshape(stds.shape + (1,)*extra_ndims))
-    components2 = distr.Independent(components2, extra_ndims)
-    mog2 = ReparametrizedMixtureSameFamily(mixture_distribution=mixture,
-                                          component_distribution=components2)
-    torch.manual_seed(123456)
-    X1 = mog.rsample(sample_shape=(5,))
-    Z1 = mog._distributional_transform(X1)
-    torch.manual_seed(123456)
-    X2 = mog2.rsample(sample_shape=(5,))
-    Z2 = mog2._distributional_transform(X2)
-    
-    assert torch.allclose(X1, X2.squeeze())
-    assert torch.allclose(Z1, Z2.squeeze())
+    # one MNIST-like batch
+    N = 8
+    x = torch.rand(N, 1, 28, 28, device=device)
+    y = torch.randint(0, 10, (N,), device=device)
 
-    # Check if multivariate runs
-    mixture3 = distr.Categorical(probs=mixture_probs[0])
-    components3 = StableNormal(loc=locs.T, scale=stds.T)
-    components3 = distr.Independent(components3, 1)
-    mog3 = ReparametrizedMixtureSameFamily(mixture_distribution=mixture3,
-                                           component_distribution=components3)
-    
-    X3 = mog3.rsample(sample_shape=(5,))
-    # TODO: add test for multivariate
+    theta, wspr = optimize_theta_pr_attack(
+        model, x, y,
+        gamma=8/255,          # typical L_inf budget for images
+        norm="linf",
+        K=3,
+        steps=100,
+        S=32,
+        lr=5e-2,
+        targeted=None,        # e.g., 2 for targeted-to-class-2
+        shared_theta=False,   # True = one θ for all N; False = per-example θ
+        entropy_reg=1e-3
+    )
+    print("Estimated WSPR after optimization:", wspr)
