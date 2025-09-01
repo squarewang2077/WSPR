@@ -1,10 +1,37 @@
+import os
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
 import torch.distributions as D
+import torchvision
+import torchvision.transforms as transforms
+import pandas as pd
 
 from irt.distributions import ReparametrizedMixtureSameFamily
 from normal import StableNormal
 
+from attacks import nattack, WithIndex
+import argparse
+
+
+# def arctanh_torch(x: torch.Tensor) -> torch.Tensor:
+#     # stable arctanh on (-1, 1)
+#     return 0.5 * torch.log((1 + x + 1e-12) / (1 - x + 1e-12))
+
+
+# def img_transform(imgs: torch.Tensor) -> torch.Tensor:
+#     """Transform the input image to tanh-space."""
+#     # imgs: (3, 32, 32), float tensor, conduct inver-normalization
+#     imgs = imgs * img_std + img_mean # range of [0,1]
+#     imgs = arctanh_torch((imgs - 0.5) / 0.5) # range of (-inf, +inf)
+#     return imgs
+
+# def img_inverse_transform(imgs: torch.Tensor) -> torch.Tensor:
+#     """Inverse transform from tanh-space to [0,1]"""
+#     imgs = torch.tanh(imgs) * 0.5 + 0.5 # range of [0,1]
+#     imgs = (imgs - img_mean) / img_std # original range of normalized image
+#     return imgs
 
 # --------------- Lp mapping into the admissible set B -----------------
 
@@ -20,10 +47,9 @@ def map_to_l2_ball(eps, gamma, eps_min=1e-12):
     flat = flat * scale
     return flat.view_as(eps)
 
-
 # --------------- θ: K-component factorized Gaussian mixture ------------
 
-class ThetaGMM(torch.nn.Module):
+class GMM(torch.nn.Module):
     """
     Factorized (diagonal) K-component mixture over R^d, with batch-size B
     (one θ per example when B == N, or shared θ when B == 1).
@@ -52,12 +78,11 @@ class ThetaGMM(torch.nn.Module):
         self.rho.data = torch.maximum(self.rho.data,
                                       torch.log(torch.exp(torch.tensor(min_scale, device=self.rho.device)) - 1.0))
 
-
 # --------------- Core: learn θ to minimize WSPR (maximize loss) --------
 
-def optimize_theta_pr_attack(
+def prattack(
     model,
-    x, y,
+    dataloader,
     gamma=0.5,
     norm="linf",          # "linf" or "l2"
     K=3,
@@ -72,13 +97,12 @@ def optimize_theta_pr_attack(
     """
     Args:
       model: classifier returning logits.
-      x: input batch [N, C, H, W]
-      y: true labels [N]
+      dataloader: data loader providing (x, y) pairs.
       gamma, norm: perturbation budget.
       targeted: None for untargeted, or an int / LongTensor with target class(es).
       shared_theta: share θ across the whole batch (B=1) or per-example θ (B=N).
     Returns:
-      theta: learned ThetaGMM
+      theta: learned GMM
       wspr_hat: Monte-Carlo estimate of WSPR after optimization
     """
     device = next(model.parameters()).device if next(model.parameters(), None) else (x.device if x.is_cuda else 'cpu')
@@ -91,7 +115,7 @@ def optimize_theta_pr_attack(
     d = x[0].numel()
 
     B = 1 if shared_theta else N
-    theta = ThetaGMM(B=B, K=K, d=d, device=device).to(device)
+    theta = GMM(B=B, K=K, d=d, device=device).to(device)
     opt = torch.optim.Adam(theta.parameters(), lr=lr)
 
     # label setup
@@ -195,30 +219,78 @@ def estimate_wspr(model, x, y, theta, gamma=0.5, norm="linf", S=1024, clamp01=Tr
     return corr
 
 
-# ---------------------- Example usage ---------------------------------
-if __name__ == "__main__":
-    # toy example (replace with your real model/x/y)
-    class TinyNet(torch.nn.Module):
-        def __init__(self, C=1, num_classes=10):
-            super().__init__()
-            self.net = torch.nn.Sequential(
-                torch.nn.Flatten(),
-                torch.nn.Linear(C*28*28, 128),
-                torch.nn.ReLU(),
-                torch.nn.Linear(128, num_classes),
-            )
-        def forward(self, z): return self.net(z)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--K", type=int, default=3)
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = TinyNet(C=1).to(device).eval()
+    parser.add_argument("--steps", type=int, default=200)
+    parser.add_argument("--gamma", type=float, default=8/255)
 
-    # one MNIST-like batch
-    N = 8
-    x = torch.rand(N, 1, 28, 28, device=device)
-    y = torch.randint(0, 10, (N,), device=device)
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--model", type=str, default="ResNet18")
+    parser.add_argument("--norm", type=str, choices=["linf", "l2"], default="linf")
+    parser.add_argument("--target_label", type=int, default=None)
 
-    theta, wspr = optimize_theta_pr_attack(
-        model, x, y,
+    args = parser.parse_args()
+
+    # Hyperparameters
+    batch_size = 512
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
+    # Directories
+    model_dir = "model_zoo/trained_model/ResNets"
+    os.makedirs(model_dir, exist_ok=True)
+
+    ### Datasets ###
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
+
+    trainset = WithIndex(torchvision.datasets.CIFAR10(root='./dataset', train=True, download=True, transform=transform_train))
+    trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=2)
+
+    testset = WithIndex(torchvision.datasets.CIFAR10(root='./dataset', train=False, download=True, transform=transform_test))
+    testloader = torch.utils.data.DataLoader(testset, batch_size=100, shuffle=False, num_workers=2)
+    ### Datasets End ###
+
+
+    ### Model Setup ###
+    model = torchvision.models.resnet18(weights=None, num_classes=10)
+    model = model.to(device)
+
+    # Load model
+    model_path = os.path.join(model_dir, "resnet18_cifar10.pth")
+    model.load_state_dict(torch.load(model_path))
+    ### Model Setup End ###
+
+    ### Evaluation ###
+    def evaluate(loader):
+        model.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for inputs, targets, _idx in loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+                _, predicted = outputs.max(1)
+                total += targets.size(0)
+                correct += predicted.eq(targets).sum().item()
+        return 100. * correct / total
+
+    print("Test Accuracy: {:.2f}%".format(evaluate(testloader)))
+    ### Evaluation End ###
+
+    # Get a batch of test data
+    theta, wspr = prattack(
+        model, 
+        testloader,
         gamma=8/255,          # typical L_inf budget for images
         norm="linf",
         K=3,
@@ -230,3 +302,7 @@ if __name__ == "__main__":
         entropy_reg=1e-3
     )
     print("Estimated WSPR after optimization:", wspr)
+
+
+if __name__ == "__main__":
+    main()
