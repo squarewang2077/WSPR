@@ -13,3 +13,6 @@
 [submodule "implicit-reparameterization-trick"]
 	path = implicit-reparameterization-trick
 	url = git@github.com:squarewang2077/implicit-reparameterization-trick.git
+[submodule "robustml"]
+	path = robustml
+	url = git@github.com:squarewang2077/robustml.git
