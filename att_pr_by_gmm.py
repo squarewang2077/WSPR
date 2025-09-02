@@ -68,7 +68,7 @@ def main():
 
     print("Test Accuracy: {:.2f}%".format(evaluate(testloader)))
 
-    fit_gmm(net, testloader, args)
+    att_pr(net, testloader, args)
 
 if __name__ == '__main__':
     main()

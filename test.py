@@ -1,309 +1,143 @@
-import os
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import torch.distributions as D
-import torchvision
-import torchvision.transforms as transforms
-import pandas as pd
+# file: wspr_gmm_optionA.py
+import os, argparse, torch, torch.nn as nn, torch.nn.functional as F
+import torchvision, torchvision.transforms as T
+from torch.distributions import Categorical, Normal, Independent, MixtureSameFamily
+from attacks import WithIndex
 
-from irt.distributions import ReparametrizedMixtureSameFamily
-from normal import StableNormal
-
-from attacks import nattack, WithIndex
-import argparse
-
-
-# def arctanh_torch(x: torch.Tensor) -> torch.Tensor:
-#     # stable arctanh on (-1, 1)
-#     return 0.5 * torch.log((1 + x + 1e-12) / (1 - x + 1e-12))
-
-
-# def img_transform(imgs: torch.Tensor) -> torch.Tensor:
-#     """Transform the input image to tanh-space."""
-#     # imgs: (3, 32, 32), float tensor, conduct inver-normalization
-#     imgs = imgs * img_std + img_mean # range of [0,1]
-#     imgs = arctanh_torch((imgs - 0.5) / 0.5) # range of (-inf, +inf)
-#     return imgs
-
-# def img_inverse_transform(imgs: torch.Tensor) -> torch.Tensor:
-#     """Inverse transform from tanh-space to [0,1]"""
-#     imgs = torch.tanh(imgs) * 0.5 + 0.5 # range of [0,1]
-#     imgs = (imgs - img_mean) / img_std # original range of normalized image
-#     return imgs
-
-# --------------- Lp mapping into the admissible set B -----------------
-
-def map_to_linf_ball(eps, gamma):
-    # elementwise clipping (box projection)
-    return torch.clamp(eps, -gamma, gamma)
-
-def map_to_l2_ball(eps, gamma, eps_min=1e-12):
-    # project each vector in eps onto L2 ball of radius gamma
-    flat = eps.view(eps.shape[:-1] + (-1,))              # [..., d]
-    norms = flat.norm(p=2, dim=-1, keepdim=True).clamp_min(eps_min)
-    scale = torch.minimum(torch.ones_like(norms), gamma / norms)
-    flat = flat * scale
-    return flat.view_as(eps)
-
-# --------------- θ: K-component factorized Gaussian mixture ------------
-
-class GMM(torch.nn.Module):
-    """
-    Factorized (diagonal) K-component mixture over R^d, with batch-size B
-    (one θ per example when B == N, or shared θ when B == 1).
-    Uses StableNormal + Independent + ReparametrizedMixtureSameFamily.
-    """
-    def __init__(self, B, K, d, init_scale=0.1, device=None):
+# -------------------- Head: outputs GMM params --------------------
+class GMMHead(nn.Module):
+    def __init__(self, feat_dim=512, K=3, D=3072, xdep=True):
         super().__init__()
-        self.B, self.K, self.d = B, K, d
-        device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        self.mix_logits = torch.nn.Parameter(torch.zeros(B, K, device=device))
-        self.loc        = torch.nn.Parameter(torch.zeros(B, K, d, device=device))
-        # parameterize scale via softplus for positivity
-        rho0 = torch.log(torch.exp(torch.tensor(init_scale, device=device)) - 1.0)
-        self.rho        = torch.nn.Parameter(rho0.expand(B, K, d).clone())
-
-    def distribution(self):
-        mix = D.Categorical(logits=self.mix_logits)                # [B, K]
-        scale = F.softplus(self.rho) + 1e-6                        # [B, K, d]
-        base = StableNormal(loc=self.loc, scale=scale)             # univariate across d
-        comp = D.Independent(base, 1)                              # event_shape=(d,)
-        return ReparametrizedMixtureSameFamily(mix, comp)
-
-    @torch.no_grad()
-    def freeze_small_scales(self, min_scale=1e-5):
-        # (optional) keep scales from collapsing to zero
-        self.rho.data = torch.maximum(self.rho.data,
-                                      torch.log(torch.exp(torch.tensor(min_scale, device=self.rho.device)) - 1.0))
-
-# --------------- Core: learn θ to minimize WSPR (maximize loss) --------
-
-def prattack(
-    model,
-    dataloader,
-    gamma=0.5,
-    norm="linf",          # "linf" or "l2"
-    K=3,
-    steps=200,
-    S=64,                 # MC samples per step
-    lr=5e-2,
-    targeted=None,        # None for untargeted; or target class int (or tensor of shape [N])
-    shared_theta=False,   # if True, share one θ across the batch
-    entropy_reg=0.0,      # small positive (e.g., 1e-3) can stabilize mixture weights
-    clamp01=True          # clamp images to [0,1]
-):
-    """
-    Args:
-      model: classifier returning logits.
-      dataloader: data loader providing (x, y) pairs.
-      gamma, norm: perturbation budget.
-      targeted: None for untargeted, or an int / LongTensor with target class(es).
-      shared_theta: share θ across the whole batch (B=1) or per-example θ (B=N).
-    Returns:
-      theta: learned GMM
-      wspr_hat: Monte-Carlo estimate of WSPR after optimization
-    """
-    device = next(model.parameters()).device if next(model.parameters(), None) else (x.device if x.is_cuda else 'cpu')
-    model.eval()
-
-    for x, y, _ in dataloader:
-        x = x.to(device)
-        y = y.to(device)
-
-    N = x.size(0)
-    d = x[0].numel()
-
-    B = 1 if shared_theta else N
-    theta = GMM(B=B, K=K, d=d, device=device).to(device)
-    opt = torch.optim.Adam(theta.parameters(), lr=lr)
-
-    # label setup
-    if targeted is None:
-        # untargeted: increase CE wrt true labels (i.e., minimize correctness)
-        target_labels = y
-    else:
-        if isinstance(targeted, int):
-            target_labels = torch.full_like(y, fill_value=targeted, device=device)
+        self.K, self.D, self.xdep = K, D, xdep
+        if xdep:
+            self.trunk = nn.Sequential(nn.Linear(feat_dim, 256), nn.ReLU())
+            self.pi_head   = nn.Linear(256, K)          # (B,K)
+            self.mu_head   = nn.Linear(256, K*D)        # (B,K*D)
+            self.logsig_head = nn.Linear(256, K*D)      # (B,K*D)
         else:
-            target_labels = torch.as_tensor(targeted, device=device, dtype=y.dtype)
+            # 全局常量（与 x 无关）
+            self.pi_logits   = nn.Parameter(torch.zeros(K))
+            self.mu          = nn.Parameter(torch.zeros(K, D))
+            self.log_sigma   = nn.Parameter(torch.zeros(K, D))
 
-    # helper to map eps to budget
-    map_B = (map_to_linf_ball if norm == "linf" else map_to_l2_ball)
-
-    for t in range(steps):
-        opt.zero_grad(set_to_none=True)
-
-        dist = theta.distribution()
-        # Sample eps: [S, B, d]; broadcast to [S, N, d] if shared theta
-        eps = dist.rsample(sample_shape=(S,))                     # [S, B, d]
-        if shared_theta:
-            eps = eps.expand(-1, N, -1).contiguous()              # [S, N, d]
-
-        # map into B (L_p ball)
-        eps = map_B(eps, gamma=gamma)                             # [S, N, d]
-
-        # build perturbed inputs
-        x_flat = x.view(N, -1)                                    # [N, d]
-        x_pert = (x_flat.unsqueeze(0) + eps).view((S,) + x.shape) # [S, N, C, H, W]
-        if clamp01:
-            x_pert = torch.clamp(x_pert, 0.0, 1.0)
-
-        # forward
-        logits = model(x_pert.view(-1, *x.shape[1:]))             # [S*N, C_classes]
-        if targeted is None:
-            # untargeted: CE wrt true label (maximize loss)
-            labels = y.repeat(S)
-            loss = F.cross_entropy(logits, labels, reduction='mean')
+    def forward(self, feat=None):
+        if self.xdep:
+            h = self.trunk(feat)                                 # (B,256)
+            pi = F.softmax(self.pi_head(h), dim=-1)              # (B,K)
+            mu = self.mu_head(h).view(-1, self.K, self.D)        # (B,K,D)
+            sigma = self.logsig_head(h).view(-1, self.K, self.D).exp().clamp_min(1e-6)
         else:
-            # targeted: CE wrt target label (minimize it to push toward target)
-            labels = target_labels.repeat(S)
-            loss = F.cross_entropy(logits, labels, reduction='mean')
+            B = feat.size(0) if feat is not None else 1
+            pi = self.pi_logits.softmax(-1).expand(B, -1)        # (B,K)
+            mu = self.mu.unsqueeze(0).expand(B, -1, -1)          # (B,K,D)
+            sigma = self.log_sigma.exp().clamp_min(1e-6).unsqueeze(0).expand(B, -1, -1)
+        return pi, mu, sigma
 
-        # entropy regularizer on mixture weights (optional)
-        if entropy_reg > 0.0:
-            probs = F.softmax(theta.mix_logits, dim=-1)           # [B, K]
-            ent = -(probs * (probs.clamp_min(1e-12)).log()).sum(dim=-1).mean()
-            loss = loss - entropy_reg * ent
+# -------------------- Build torch.distributions GMM (for eval/WSPR) --------------------
+def build_gmm(pi, mu, sigma):
+    # pi:(B,K), mu/sigma:(B,K,D)
+    mix = Categorical(pi)                               # mixture
+    comp = Independent(Normal(mu, sigma), 1)            # (B,K,D) vector-component
+    return MixtureSameFamily(mix, comp)                 # 注意：没有 rsample！
 
-        # We want worst-case θ:
-        # - Untargeted: maximize CE wrt true labels  -> descend on -loss
-        # - Targeted:   minimize CE wrt target label -> descend on +loss
-        obj = (-loss) if targeted is None else (loss)
-        obj.backward()
-        opt.step()
-
-        if (t + 1) % max(1, steps // 10) == 0:
-            with torch.no_grad():
-                pred = logits.argmax(dim=1)
-                acc = (pred == labels).float().mean().item()
-            if targeted is None:
-                print(f"[{t+1:4d}/{steps}] loss={loss.item():.4f}  CE↑ acc_under_dist={acc:.3f}")
-            else:
-                print(f"[{t+1:4d}/{steps}] loss={loss.item():.4f}  CE↓ target_acc={acc:.3f}")
-
-        theta.freeze_small_scales()
-
-    # Monte-Carlo WSPR estimate after training θ
-    with torch.no_grad():
-        wspr_hat = estimate_wspr(model, x, y, theta, gamma=gamma, norm=norm, S=max(2048//max(1,N), 256), clamp01=clamp01)
-
-    return theta, wspr_hat
-
-
-# ---------------------- WSPR estimator --------------------------------
-
-@torch.no_grad()
-def estimate_wspr(model, x, y, theta, gamma=0.5, norm="linf", S=1024, clamp01=True):
+# -------------------- Option A loss: pathwise per component --------------------
+def optionA_loss(net, pi, mu, sigma, x, y, gamma=8/255, S=1):
     """
-    Returns MC estimate of WSPR = P_{ε~ωθ}[ f(x+ε) = y ]
+    L = sum_k pi_k(x) * E_z CE(f(x + g_B(mu_k + sigma_k * z)), y),  z~N(0,I)
+    这里对每个分量使用 Normal.rsample，避免对混合 rsample（MixtureSameFamily 没实现）。
     """
     device = x.device
-    N = x.size(0)
-    d = x[0].numel()
+    B, C, H, W = x.shape
+    K, D = mu.size(1), mu.size(2)
+    total = 0.0
+    for k in range(K):
+        # (S,B,D) 路径采样
+        z = torch.randn(S, B, D, device=device)
+        eps_latent = mu[:, k, :].unsqueeze(0) + sigma[:, k, :].unsqueeze(0) * z
+        # 直接视作像素噪声（D=C*H*W）
+        eps = eps_latent.view(S*B, C, H, W)
+        eps = torch.tanh(eps) * gamma                      # g_B
+        x_rep = x.unsqueeze(0).expand(S, -1, -1, -1, -1).reshape(S*B, C, H, W)
+        y_rep = y.repeat(S)
+        logits = net(x_rep + eps)
+        L = F.cross_entropy(logits, y_rep, reduction="none").view(S, B).mean(0) # E_z
+        # 权重加和（pi 可能是 (B,K)）
+        total = total + pi[:, k] * L
+    return total.mean()
 
-    dist = theta.distribution()
-    eps = dist.rsample(sample_shape=(S,))                         # [S, B, d]
-    if theta.B == 1:
-        eps = eps.expand(-1, N, -1).contiguous()                  # [S, N, d]
-    eps = map_to_linf_ball(eps, gamma) if norm == "linf" else map_to_l2_ball(eps, gamma)
+# -------------------- Train phi (GMM head) --------------------
+def fit_phi(net, loader, args, device):
+    # 冻结分类器；用其 backbone 提特征（最后一层 avgpool + flatten）
+    backbone = nn.Sequential(*list(net.children())[:-1], nn.Flatten()).to(device)
+    for p in net.parameters(): p.requires_grad_(False)
+    for p in backbone.parameters(): p.requires_grad_(False)
 
-    x_flat = x.view(N, -1)
-    x_pert = (x_flat.unsqueeze(0) + eps).view((S,) + x.shape)
-    if clamp01:
-        x_pert = torch.clamp(x_pert, 0.0, 1.0)
+    C,H,W = 3,32,32
+    D = C*H*W
+    head = GMMHead(feat_dim=512, K=args.num_modes, D=D, xdep=args.xdep).to(device)
+    opt = torch.optim.Adam(head.parameters(), lr=args.lr)
 
-    logits = model(x_pert.view(-1, *x.shape[1:]))                 # [S*N, C]
-    pred = logits.argmax(dim=1).view(S, N)
-    corr = (pred == y.view(1, N).expand(S, N)).float().mean().item()
-    return corr
+    for ep in range(1, args.epochs+1):
+        for it,(x,y,_) in enumerate(loader):
+            x, y = x.to(device), y.to(device)
+            feat = backbone(x)                               # (B,512)
+            pi, mu, sigma = head(feat)                       # (B,K),(B,K,D),(B,K,D)
+            loss = optionA_loss(net, pi, mu, sigma, x, y, gamma=args.gamma, S=args.mc)
+            opt.zero_grad(); loss.backward(); opt.step()
+            if it % 50 == 0:
+                print(f"[ep {ep} it {it}] loss={loss.item():.4f} | pi[0]={pi[0].detach().cpu().numpy()}")
+    return head, backbone
 
+# -------------------- Estimate WSPR (Monte Carlo under learned GMM) --------------------
+@torch.no_grad()
+def estimate_wspr(net, gmm, x, y, gamma=8/255, T=50):
+    """
+    估计  E[ 1{ f(x+g_B(eps)) = y } ]  ，eps ~ GMM_phi(x)
+    这里用 mixture.sample（评估时可用，无需梯度），然后过 g_B 与分类器。
+    """
+    B, C, H, W = x.shape
+    # (T,B,D)
+    eps_latent = gmm.sample((T,))
+    eps = torch.tanh(eps_latent.view(T, B, C, H, W)) * gamma
+    x_rep = x.unsqueeze(0) + eps                           # (T,B,C,H,W)
+    logits = net(x_rep.view(T*B, C, H, W)).view(T, B, -1)
+    pred = logits.argmax(dim=-1)                           # (T,B)
+    correct = (pred == y.unsqueeze(0)).float().mean(dim=0) # per-sample prob
+    return correct.mean().item()                           # batch average
 
+# -------------------- Main --------------------
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--K", type=int, default=3)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--num_modes", type=int, default=3)
+    ap.add_argument("--epochs", type=int, default=1)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--gamma", type=float, default=8/255)
+    ap.add_argument("--mc", type=int, default=1)
+    ap.add_argument("--xdep", action="store_true", help="让 π,μ,σ 依赖 x")
+    args = ap.parse_args()
 
-    parser.add_argument("--steps", type=int, default=200)
-    parser.add_argument("--gamma", type=float, default=8/255)
-
-    parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--model", type=str, default="ResNet18")
-    parser.add_argument("--norm", type=str, choices=["linf", "l2"], default="linf")
-    parser.add_argument("--target_label", type=int, default=None)
-
-    args = parser.parse_args()
-
-    # Hyperparameters
-    batch_size = 512
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    # Directories
-    model_dir = "model_zoo/trained_model/ResNets"
-    os.makedirs(model_dir, exist_ok=True)
+    # 数据：用 CIFAR-10 test，与你原脚本一致
+    tf = T.Compose([T.ToTensor(), T.Normalize((0.4914,0.4822,0.4465),(0.2023,0.1994,0.2010))])
+    testset = WithIndex(torchvision.datasets.CIFAR10(root="./dataset", train=False, download=True, transform=tf))
+    loader = torch.utils.data.DataLoader(testset, batch_size=64, shuffle=False, num_workers=2, pin_memory=True)
 
-    ### Datasets ###
-    transform_train = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-    ])
-    transform_test = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-    ])
+    # 分类器：这里用随机初始化（你也可以自己 load 预训练权重）
+    net = torchvision.models.resnet18(weights=None, num_classes=10).to(device)
+    net.eval(); [p.requires_grad_(False) for p in net.parameters()]
 
-    trainset = WithIndex(torchvision.datasets.CIFAR10(root='./dataset', train=True, download=True, transform=transform_train))
-    trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=2)
+    # 训练 φ（得到 x->GMM 的映射）
+    head, backbone = fit_phi(net, loader, args, device)
 
-    testset = WithIndex(torchvision.datasets.CIFAR10(root='./dataset', train=False, download=True, transform=transform_test))
-    testloader = torch.utils.data.DataLoader(testset, batch_size=100, shuffle=False, num_workers=2)
-    ### Datasets End ###
-
-
-    ### Model Setup ###
-    model = torchvision.models.resnet18(weights=None, num_classes=10)
-    model = model.to(device)
-
-    # Load model
-    model_path = os.path.join(model_dir, "resnet18_cifar10.pth")
-    model.load_state_dict(torch.load(model_path))
-    ### Model Setup End ###
-
-    ### Evaluation ###
-    def evaluate(loader):
-        model.eval()
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for inputs, targets, _idx in loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = model(inputs)
-                _, predicted = outputs.max(1)
-                total += targets.size(0)
-                correct += predicted.eq(targets).sum().item()
-        return 100. * correct / total
-
-    print("Test Accuracy: {:.2f}%".format(evaluate(testloader)))
-    ### Evaluation End ###
-
-    # Get a batch of test data
-    theta, wspr = prattack(
-        model, 
-        testloader,
-        gamma=8/255,          # typical L_inf budget for images
-        norm="linf",
-        K=3,
-        steps=100,
-        S=32,
-        lr=5e-2,
-        targeted=None,        # e.g., 2 for targeted-to-class-2
-        shared_theta=False,   # True = one θ for all N; False = per-example θ
-        entropy_reg=1e-3
-    )
-    print("Estimated WSPR after optimization:", wspr)
-
+    # —— 如何拿到 Distribution 对象并估计 WSPR —— #
+    x, y, _ = next(iter(loader))
+    x, y = x.to(device), y.to(device)
+    pi, mu, sigma = head(backbone(x))
+    gmm = build_gmm(pi, mu, sigma)                   # 这是正式的 torch.distributions GMM
+    wspr_est = estimate_wspr(net, gmm, x, y, gamma=args.gamma, T=32)
+    print(f"[eval] estimated WSPR (prob. of correct under learned GMM): {wspr_est:.4f}")
 
 if __name__ == "__main__":
     main()
