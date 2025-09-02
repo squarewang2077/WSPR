@@ -1,17 +1,12 @@
-name: base
+name: WSPR
 channels:
   - defaults
 dependencies:
-  - python=3.13
-  - conda==25.5.1
-  - setuptools
-  - pip
-  - wheel
-  - conda-anaconda-telemetry
-  - conda-anaconda-tos[version='>=0.2.0']
-  - conda-content-trust
-  - conda-libmamba-solver
-  - menuinst
-  - anaconda-anon-usage
-  - numpy
-  - matplotlib
+  - python=3.10
+  - pytorch
+  - pandas
+  - torchvision
+  - pytorch-cuda=12.1
+  - torchaudio
+  - ipykernel
+  - pillow[version='>=10.0']
