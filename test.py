@@ -86,6 +86,19 @@ def infer_feat_dim(fe: nn.Module, img_shape):
     dummy = torch.zeros(1, C, H, W, device=next(fe.parameters()).device)
     return fe(dummy).shape[-1]
 
+# Evaluation 
+@torch.no_grad()
+def eval_acc(model, loader, device):
+    model.eval(); correct=total=0
+    for x,y,_ in loader:
+        x,y=x.to(device),y.to(device)
+        pred=model(x).argmax(1)
+        correct += (pred==y).sum().item(); total += y.numel()
+    acc = correct/total
+    print(f"[clf] accuracy={acc*100:.2f}%"); return acc
+
+
+
 # -------------------- External Encoder (NEW) --------------------
 class TinyCNNEncoder(nn.Module):
     """一个轻量可训练的 Encoder（不依赖 ImageNet 预训练）"""
@@ -315,7 +328,7 @@ def g_ball(u, gamma, norm_type):
     raise ValueError
 
 # -------------------- Option A loss (with optional decoder) --------------------
-def optionA_loss(net, pi, mu, cov, x, y, decoder, gamma=8/255, S=1, norm_type="linf",
+def PR_loss(net, pi, mu, cov, x, y, decoder, gamma=8/255, S=1, norm_type="linf",
                  cov_type="diag", use_decoder=True, out_shape=None):
     B, C, H, W = x.shape
     K, D = mu.size(1), mu.size(2)
@@ -342,20 +355,20 @@ def optionA_loss(net, pi, mu, cov, x, y, decoder, gamma=8/255, S=1, norm_type="l
                    + torch.einsum('sbr,bdr->sbd', z1, Uk)
                    + sigk.unsqueeze(0)*z2)
 
-        # latent -> 未约束像素噪声 u
         if use_decoder:
-            u = decoder(lat.view(S*B, D))
-        else:
-            # 直接像素空间：D 必须等于 C*H*W
-            u = lat.view(S*B, C, H, W)
+            u = decoder(lat.view(S*B, D)) # consider decoder to reduce the dimentions of latent space
+        # in PR_loss, inside the else branch of `if use_decoder`
+        else: # in case of no decoder, latent dim D must be C*H*W
+            assert D == C * H * W, f"latent dim D={D} must equal C*H*W={C*H*W} when --use_decoder=False"
+            u = lat.view(S * B, C, H, W) # reshape the latent variable
 
-        eps = g_ball(u, gamma=gamma, norm_type=norm_type)
+        eps = g_ball(u, gamma=gamma, norm_type=norm_type) # mapping into perturbation ball
 
-        x_rep = x.unsqueeze(0).expand(S, -1, -1, -1, -1).reshape(S*B, C, H, W)
-        y_rep = y.repeat(S)
-        logits = net(x_rep + eps)
-        L_ce = F.cross_entropy(logits, y_rep, reduction="none").view(S,B).mean(0)
-        total = total + pi[:, k] * L_ce
+        x_rep = x.unsqueeze(0).expand(S, -1, -1, -1, -1).reshape(S*B, C, H, W) # x is of [B, C, H, W], e.g., [128, 3, 32, 32], to [S*B, C, H, W]
+        y_rep = y.repeat(S) # y is of [B], e.g., [128], to [S*B]
+        logits = net(x_rep + eps) # logit is of [S*B, num_classes], e.g., [128*S, 10]
+        L_ce = F.cross_entropy(logits, y_rep, reduction="none").view(S,B).mean(0) # mean over S samples, L_ce is of [B]
+        total = total + pi[:, k] * L_ce # pi is of [B,K], pi[:, k] is of [B]
 
     return total.mean()
 
@@ -399,116 +412,220 @@ def fit_phi(model, feat_extractor, loader, args, device, out_shape):
                 feat = torch.zeros(x.size(0), feat_dim, device=device)  # x-独立时占位
             
             pi, mu, cov = head(feat)
-            loss = optionA_loss(model, pi, mu, cov, x, y, decoder,
+            loss = PR_loss(model, pi, mu, cov, x, y, decoder,
                                 gamma=args.gamma, S=args.mc, norm_type=args.norm,
                                 cov_type=args.cov_type, use_decoder=args.use_decoder, out_shape=out_shape)
             opt.zero_grad(); loss.backward(); opt.step()
-            if it % 5 == 0:
+            if it % 1 == 0:
                 print(f"[ep{ep} it{it}] loss={loss.item():.4f}")
     return head, encoder, decoder
 
 # -------------------- Visualization --------------------
+
+def cov_from_param(cov, cov_type):
+    """Return Sigma: (B,K,D,D) from parameterization."""
+    if cov_type == "diag":
+        sigma = cov  # (B,K,D)
+        B,K,D = sigma.shape
+        eye = torch.eye(D, device=sigma.device).view(1,1,D,D)
+        return (sigma**2).unsqueeze(-1) * eye  # (B,K,D,D)
+    elif cov_type == "full":
+        L = cov  # (B,K,D,D)
+        return L @ L.transpose(-1, -2)
+    else:  # lowrank
+        U, sigma = cov  # U:(B,K,D,r), sigma:(B,K,D)
+        B,K,D,_ = U.shape
+        eye = torch.eye(D, device=U.device).view(1,1,D,D)
+        return U @ U.transpose(-1, -2) + (sigma**2).unsqueeze(-1) * eye + 1e-6 * eye
+
+def pca_2d(X):
+    """
+    X: (N,D) tensor. Returns:
+      mean: (D,), P: (2,D) projection rows; Y: (N,2) projected.
+    """
+    Xc = X - X.mean(0, keepdim=True)
+    # SVD on covariance (no sklearn needed)
+    U, S, Vt = torch.linalg.svd(Xc, full_matrices=False)
+    P = Vt[:2, :]           # top-2 PCs as rows
+    Y = (Xc @ P.T)          # (N,2)
+    return X.mean(0), P, Y
+
+def ellipse_from_cov2(cov2, nsig=2.0):
+    """
+    cov2: (2,2) → radii and angle (in degrees) for matplotlib.
+    """
+    eigvals, eigvecs = torch.linalg.eigh(cov2)
+    # Ensure ascending; largest last
+    l1, l2 = eigvals.clamp_min(1e-12).sqrt() * nsig
+    v = eigvecs[:, 1]  # principal axis
+    angle = torch.atan2(v[1], v[0]) * 180.0 / math.pi
+    return float(l2), float(l1), float(angle)  # width,height,angle
+
+
 @torch.no_grad()
 def viz_all(loader, head, encoder, decoder, build_gmm, g_ball, args, out_shape, save_dir="viz"):
     """
-    Simple viz:
-      1) pi_bar.png   – avg mixture weights over ~50 batches
-      2) samples.png  – grid of perturbations sampled from the GMM for one image
+    Two figures:
+      - pi_bar.png  : average mixture weights over a few batches
+      - gmm_pca2d.png: μ (projected to 2D via PCA) + covariance ellipses (Σ projected)
     """
     os.makedirs(save_dir, exist_ok=True)
     device = next(head.parameters()).device
     C, H, W = out_shape
 
-    # ---------- (1) Average mixture weights ----------
+    # --------- (1) π bar ----------
     max_batches = 50
-    all_pi = []
+    pis = []
     for i, (x, _, _) in enumerate(loader):
         if i >= max_batches: break
         x = x.to(device)
-        if args.xdep:
-            feat = encoder(x)
-        else:
-            # x-independent case: give a dummy feat vector of zeros (shape aligned with head)
-            B = x.size(0)
-            feat_dim = head.mu_head.in_features if head.xdep else head.mu.shape[-1]
-            feat = torch.zeros(B, feat_dim, device=device)
-        pi, _, _ = head(feat)      # (B,K)
-        all_pi.append(pi.cpu())
+        feat = encoder(x) if args.xdep else torch.zeros(x.size(0), head.mu_head.in_features, device=device)
+        pi, _, _ = head(feat)  # (B,K)
+        pis.append(pi.cpu())
+    P = torch.cat(pis, 0)  # (N,K)
+    avg_pi = P.mean(0).numpy()
 
-    P = torch.cat(all_pi, dim=0)   # (N,K)
-    avg = P.mean(0).numpy()
-
-    plt.figure(figsize=(max(6, 0.6*len(avg)), 3.5))
-    plt.bar(range(len(avg)), avg)
+    plt.figure(figsize=(max(6, 0.6*len(avg_pi)), 3.5))
+    plt.bar(range(len(avg_pi)), avg_pi)
     plt.xlabel("component k"); plt.ylabel("mean π_k")
     plt.title("Average mixture weights π")
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, "pi_bar.png"))
     plt.close()
 
-    # ---------- (2) Samples from GMM -> perturbation grid ----------
-    # take a single image to condition the x-dependent head
+    # --------- (2) μ & Σ in 2D via PCA ----------
+    # Take one conditioning image to get (1,K,*) parameters
     x, _, _ = next(iter(loader))
-    x = x[:1].to(device)                 # (1,C,H,W)
-    if args.xdep:
-        feat = encoder(x)                # (1,feat_dim)
-    else:
-        feat_dim = head.mu_head.in_features if head.xdep else head.mu.shape[-1]
-        feat = torch.zeros(1, feat_dim, device=device)
+    x = x[:1].to(device)
+    feat = encoder(x) if args.xdep else torch.zeros(1, head.mu_head.in_features, device=device)
+    pi, mu, cov = head(feat)          # mu: (1,K,D)
+    Sigma = cov_from_param(cov, args.cov_type)[0]  # (K,D,D)
 
-    pi, mu, cov = head(feat)             # shapes: (1,K,*) with batch B=1
-    gmm = build_gmm(pi, mu, cov, cov_type=args.cov_type)
+    K, D = mu.size(1), mu.size(2)
+    muK = mu[0]                        # (K,D)
 
-    T = 36                                # number of samples for the grid
-    z = gmm.sample((T,))                  # (T, 1, D)
-    z = z.squeeze(1)                      # (T, D)
+    # PCA using component means
+    _, P, Y = pca_2d(muK)              # P: (2,D), Y: (K,2)
 
-    if args.use_decoder:
-        u = decoder(z)                    # (T, C, H, W)
-    else:
-        # direct pixel latent: D should equal C*H*W
-        u = z.view(T, C, H, W)
+    # Project covariances: cov2 = P Σ P^T  (shape (K,2,2))
+    Pm = P.to(muK.device)
+    cov2 = torch.einsum('ad,kdc,bd->k ab', Pm, Sigma, Pm)  # (K,2,2)
 
-    eps = g_ball(u, gamma=args.gamma, norm_type=args.norm)
-    vutils.save_image(
-        eps, os.path.join(save_dir, "samples.png"),
-        nrow=int(math.sqrt(T)), normalize=True, scale_each=True
-    )
+    # Plot means + ellipses
+    from matplotlib.patches import Ellipse
+    fig, ax = plt.subplots(figsize=(6, 6))
+    Ynp = Y.cpu().numpy()
 
-    print(f"[viz] saved: {os.path.join(save_dir,'pi_bar.png')} and samples.png")
+    # scale marker size by pi
+    pik = pi[0].cpu().numpy()
+    sizes = 300.0 * (pik / pik.max() + 1e-8)
+
+    ax.scatter(Ynp[:, 0], Ynp[:, 1], s=sizes, alpha=0.8, edgecolors='k')
+    for k in range(K):
+        w, h, ang = ellipse_from_cov2(cov2[k])
+        e = Ellipse(xy=(Ynp[k, 0], Ynp[k, 1]), width=w, height=h, angle=ang,
+                    fill=False, lw=2, alpha=0.8)
+        ax.add_patch(e)
+        ax.text(Ynp[k, 0], Ynp[k, 1], f"{k}", fontsize=9, ha='center', va='center')
+
+    ax.set_title("GMM in latent space (PCA to 2D): means & covariance ellipses")
+    ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
+    ax.grid(True, ls='--', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "gmm_pca2d.png"))
+    plt.close()
+
+    print(f"[viz] saved: {os.path.join(save_dir,'pi_bar.png')} and gmm_pca2d.png")
+
+# ------------------- PR computation -------------------
+@torch.no_grad()
+def compute_pr(model, head, encoder, decoder, loader, args, out_shape, S=10, max_batches=50):
+    """
+    Monte-Carlo estimate of PR:
+      PR = E_{x,y} E_{eps~GMM_phi(.|x)} [ 1{ f(x + g_B(eps)) = y } ]
+    Returns scalar PR in [0,1].
+    """
+    device = next(head.parameters()).device
+    C, H, W = out_shape
+
+    correct_sum = 0.0
+    count = 0
+
+    for b, (x, y, _) in enumerate(loader):
+        if b >= max_batches: break
+        x, y = x.to(device), y.to(device)
+        B = x.size(0)
+
+        # parameters conditional on x
+        if args.xdep:
+            feat = encoder(x)
+        else:
+            feat = torch.zeros(B, head.mu_head.in_features, device=device)
+        pi, mu, cov = head(feat)             # shapes (B,K,*)
+
+        # Build conditional mixture; torch.distributions supports vectorized batch
+        gmm = build_gmm(pi, mu, cov, cov_type=args.cov_type)
+
+        # S samples per image: (S,B,D)
+        z = gmm.sample((S,))                 # (S,B,D)
+
+        if args.use_decoder:
+            u = decoder(z.view(S * B, -1))   # (S*B,C,H,W)
+        else:
+            assert z.size(-1) == C*H*W, "When --use_decoder=False, latent dim must be C*H*W."
+            u = z.view(S * B, C, H, W)
+
+        eps = g_ball(u, gamma=args.gamma, norm_type=args.norm)
+        x_rep = x.unsqueeze(0).expand(S, -1, -1, -1, -1).reshape(S * B, C, H, W)
+        y_rep = y.repeat(S)
+
+        logits = model(x_rep + eps)
+        pred = logits.argmax(1)
+        corr = (pred == y_rep).float().view(S, B).mean(0)  # per-sample correctness prob
+        correct_sum += corr.sum().item()
+        count += B
+
+    pr = correct_sum / max(1, count)
+    print(f"[PR] Monte-Carlo estimate over {count} examples (S={S}): PR = {pr:.4f}")
+    return pr
+
+
 
 # -------------------- Main --------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", choices=["cifar10","cifar100","mnist","tinyimagenet"], default="cifar10")
     ap.add_argument("--arch", choices=["resnet18","resnet50","wide_resnet50_2","vgg16","densenet121","mobilenet_v3_large","efficientnet_b0","vit_b_16"], default="resnet18")
+    ap.add_argument("--clf_ckpt", type=str, default="", help="path to trained classifier checkpoint (required)")
     ap.add_argument("--device", default="cuda:0")
 
     # --- NEW: external encoder controls x-dependence ---
-    ap.add_argument("--encoder_backend", choices=["classifier","resnet18_imnet","vit_b_16_imnet","cnn_tiny"], default="classifier",
-                    help="choose external encoder to parameterize x-dependent pi/mu/sigma")
+    ap.add_argument("--encoder_backend", choices=["classifier","resnet18_imnet","vit_b_16_imnet","cnn_tiny"], \
+                    default="classifier", help="choose external encoder to parameterize x-dependent pi/mu/sigma")
     ap.add_argument("--encoder_ckpt", default="", help="path to your pretrained encoder (optional)")
-    ap.add_argument("--freeze_encoder", action="store_true", help="freeze the external encoder")
+    ap.add_argument("--freeze_encoder", action="store_true", default=True, help="freeze the external encoder") # store ture for test
 
     # Decoder control
-    ap.add_argument("--use_decoder", action="store_true", default=False, help="use decoder to map latent->image noise; else direct pixel latent")
+    ap.add_argument("--use_decoder", action="store_true", default=False, \
+                    help="use decoder to map latent->image noise; else direct pixel latent") # store false for test
     ap.add_argument("--decoder_backend", choices=["conv","biggan256"], default="conv")
     ap.add_argument("--freeze_decoder", action="store_true")
     ap.add_argument("--gan_class", type=int, default=207)
     ap.add_argument("--gan_truncation", type=float, default=0.5)
 
     # GMM + training
-    ap.add_argument("--num_modes", type=int, default=5)
+    ap.add_argument("--num_modes", type=int, default=1)
     ap.add_argument("--latent_dim", type=int, default=64, help="latent dim (only used when --use_decoder)")
     ap.add_argument("--cov_type", choices=["diag","full","lowrank"], default="diag")
     ap.add_argument("--cov_rank", type=int, default=8)
     ap.add_argument("--epochs", type=int, default=1)
-    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--lr", type=float, default=2e-6)
     ap.add_argument("--gamma", type=float, default=8/255)
-    ap.add_argument("--mc", type=int, default=1)
-    ap.add_argument("--xdep", default=True, action="store_true")
+    ap.add_argument("--mc", type=int, default=100, \
+                    help="MC samples per image per step")
+    ap.add_argument("--xdep", default=True, action="store_true") # store true for test
     ap.add_argument("--norm", choices=["l2","linf"], default="linf")
-    ap.add_argument("--batch_size", type=int, default=64)
+    ap.add_argument("--batch_size", type=int, default=1)
 
     args = ap.parse_args()
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -517,9 +634,25 @@ def main():
     loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
     model, feat_extractor = build_model(args.arch, num_classes, device)
+
+    # Load classifier ckpt
+    if not args.clf_ckpt or not os.path.isfile(args.clf_ckpt):
+        raise ValueError("You must provide --clf_ckpt pointing to a trained classifier on this dataset.")
+    state = torch.load(args.clf_ckpt, map_location="cpu")
+    if "state_dict" in state: state = state["state_dict"]
+    state = {k.replace("module.",""): v for k,v in state.items()}
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    print(f"[clf] loaded. missing={len(missing)} unexpected={len(unexpected)}")
+    model.eval()
+    eval_acc(model, loader, device) # eval acc
+
+    # Train φ
     head, encoder, decoder = fit_phi(model, feat_extractor, loader, args, device, out_shape)
     viz_all(loader, head, encoder if args.xdep else (feat_extractor if args.encoder_backend=="classifier" else encoder),
             decoder, build_gmm, g_ball, args, out_shape, save_dir="viz")
+    _ = compute_pr(model, head, encoder if args.xdep else (feat_extractor if args.encoder_backend=="classifier" else encoder),
+               decoder, loader, args, out_shape, S=10, max_batches=50)
+
 
 if __name__=="__main__":
     main()
