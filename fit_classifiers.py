@@ -265,7 +265,7 @@ def main():
     ap.add_argument("--weight_decay", type=float, default=5e-4)
     ap.add_argument("--label_smoothing", type=float, default=0.0)
     ap.add_argument("--pretrained", type=lambda s: s.lower() in ["1","true","yes","y"], default=True,
-                    help="Use ImageNet-pretrained weights (and 224×224 inputs)")
+                    help="Use ImageNet-pretrained weights (and 224 x 224 inputs)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", type=str, default="cuda")
     # If --out is empty, we will save to ./model_zoo/trained_model/<arch>_<dataset>.pth
