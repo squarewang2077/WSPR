@@ -37,6 +37,7 @@ def build_encoder(backend: str, img_shape, device, ckpt="", freeze=True):
     backend = backend.lower()
 
     if backend == "classifier": # reuse features from classifiers
+        
         return None, None
 
     if backend == "resnet18_imnet":

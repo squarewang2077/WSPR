@@ -143,7 +143,6 @@ def build_model(arch: str, num_classes: int, device):
     return model, feat_extractor
 
 
-
 @torch.no_grad()
 def infer_feat_dim(fe: nn.Module, img_shape):
     '''

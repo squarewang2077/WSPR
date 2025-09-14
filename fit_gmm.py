@@ -4,8 +4,9 @@ import torch
 import torch.nn as nn
 import pandas as pd
 import torch.nn.functional as F
-from torch.distributions import Categorical, Normal, Independent, MixtureSameFamily, MultivariateNormal
+from torch.distributions import Categorical, Normal, Independent, MixtureSameFamily, MultivariateNormal, LowRankMultivariateNormal
 from utils import *
+from tqdm import tqdm
 
 # ------------------ GMM Head (diag/full/lowrank) --------------------
 class GMM(nn.Module):
@@ -19,6 +20,10 @@ class GMM(nn.Module):
         self.K, self.D, self.xdep = K, latent_dim, xdep
         self.cov_type, self.r = cov_type, cov_rank
         hid = 512
+
+        # this is only uesd when xdep=True in self.from_package()
+        self._feat_extractor = None  # placeholder, set externally if needed
+
         if xdep: # if the omega is x-dependent
             # here trunk is a simple 2-layer MLP, it can be removed or replaced by a more complex network
             self.trunk = nn.Sequential(nn.Linear(feat_dim, hid), nn.ReLU()) # feature to hidden
@@ -94,11 +99,18 @@ class GMM(nn.Module):
         elif cov_type == "full":
             comp = MultivariateNormal(loc=mu, scale_tril=cov)
         elif cov_type == "lowrank":
+
             U, sigma = cov # U: (B,K,D,r), sigma: (B,K,D)
-            B, K, D, _ = U.shape
-            eye = torch.eye(D, device=U.device).view(1, 1, D, D) # identity matrix of (1,1,D,D)
-            cov_mat = U @ U.transpose(-1, -2) + (sigma**2).unsqueeze(-1)*eye + 1e-5*eye
-            comp = MultivariateNormal(loc=mu, covariance_matrix=cov_mat)
+            comp = LowRankMultivariateNormal(
+                    loc=mu,
+                    cov_factor=U,
+                    cov_diag=(sigma**2 + 1e-5)   # diagonal variance
+                )
+
+            # B, K, D, _ = U.shape
+            # eye = torch.eye(D, device=U.device).view(1, 1, D, D) # identity matrix of (1,1,D,D)
+            # cov_mat = U @ U.transpose(-1, -2) + (sigma**2).unsqueeze(-1)*eye + 1e-5*eye
+            # comp = MultivariateNormal(loc=mu, covariance_matrix=cov_mat)
         else:
             raise ValueError("cov_type must be diag/full/lowrank")
         return MixtureSameFamily(mix, comp)
@@ -219,8 +231,13 @@ class GMM(nn.Module):
         # --- per-batch loss history ---
         loss_hist = {}  # it -> [loss at ep1, loss at ep2, ...]
 
-        for ep in range(1, args.epochs + 1):
-            for it, (x, y, _) in enumerate(loader):
+        epoch_bar = tqdm(range(1, args.epochs + 1), desc="Epochs")
+        for ep in epoch_bar:
+            epoch_losses = []
+            pbar = tqdm(enumerate(loader), total=len(loader), desc=f"Epoch {ep}", leave=False)
+            for it, (x, y, _) in pbar:
+        # for ep in range(1, args.epochs + 1):
+        #     for it, (x, y, _) in enumerate(loader):
                 if (batch_indices is not None) and (it not in batch_indices): # target specific batches only
                     continue
 
@@ -247,7 +264,7 @@ class GMM(nn.Module):
                 loss = self.pr_loss(model, pi, mu, cov, x, y, decoder,
                                     gamma=args.gamma, S=args.mc, norm_type=args.norm,
                                     cov_type=self.cov_type, use_decoder=args.use_decoder, out_shape=out_shape,
-                                    loss_variant="ce", softplus_beta=1.0  # smoother
+                                    loss_variant="cw", softplus_beta=1.0  # smoother
                                     )
 
                 opt.zero_grad()
@@ -257,8 +274,14 @@ class GMM(nn.Module):
                 # record
                 loss_hist.setdefault(it, []).append(float(loss.item()))
 
-                if it % 1 == 0:
-                    print(f"[ep{ep} it{it}] loss={loss.item():.4f}  (used {y.numel()} clean-correct)")
+
+                pbar.set_postfix({"loss": f"{loss.item():.4f}", "used": y.numel()})
+                epoch_losses.append(loss.item())
+                if epoch_losses:
+                    mean_loss = sum(epoch_losses) / len(epoch_losses)
+                    epoch_bar.set_postfix({"avg_loss": f"{mean_loss:.4f}"})
+                # if it % 1 == 0:
+                #     print(f"[ep{ep} it{it}] loss={loss.item():.4f}  (used {y.numel()} clean-correct)")
                     # break  # debug only one batch per epoch
 
         return encoder, decoder, loss_hist
@@ -288,7 +311,7 @@ class GMM(nn.Module):
         Notes:
         - Uses self.xdep/self.cov_type/self.D 等结构属性。
         - encoder 仅在 self.xdep=True 时需要；其输出维度应匹配 self.trunk 的输入维度。
-        - 当 use_decoder=False 时, latent 维度必须等于 C*H*W。
+        - 当 use_decoder=False 时，latent 维度必须等于 C*H*W。
         """
         device = next(self.parameters()).device
         C, H, W = out_shape
@@ -324,13 +347,13 @@ class GMM(nn.Module):
             if self.xdep:
                 if encoder is None:
                     raise RuntimeError("GMM.compute_pr_on_clean_correct: self.xdep=True but encoder is None.")
-                feat = encoder(x_sel)                    # (n, feat_dim)
+                feat = encoder(x_sel) # (n, feat_dim)
             else:
                 # x-independent: feat only provides batch size
                 feat = torch.empty(n, 0, device=device)
 
             # ---- GMM parameters & mixture ----
-            pi, mu, cov = self(feat) #.forward; shapes (n,K,*)
+            pi, mu, cov = self(feat)                     # shapes (n,K,*)
             gmm = self.mixture(pi, mu, cov, cov_type=self.cov_type)
 
             # ---- sample S per item: z ~ q(z|x) ----
@@ -543,6 +566,7 @@ class GMM(nn.Module):
 
         return gmm, enc, dec, meta
 
+
 def _slug_gamma(g):
     # make gamma filename-safe, e.g. 0.03137255 -> 0p0314
     return f"{g:.4f}".replace('.', 'p')
@@ -558,10 +582,10 @@ def main():
                     help="path to trained classifier checkpoint (required)")
     ap.add_argument("--device", default="cuda")
 
-    ap.add_argument("--batch_idx", type=str, default="",
+    ap.add_argument("--batch_idx", type=str, default="0-40",
                     help="Which batch indices to TRAIN and compute PR on (e.g., '0', '0,3,5-10'). Empty=all.")
-    ap.add_argument("--viz_batch", type=int, default=-1,
-                    help="Batch index for the PCA viz (-1 means first batch).")
+    # ap.add_argument("--viz_batch", type=int, default=-1,
+    #                 help="Batch index for the PCA viz (-1 means first batch).")
 
     # --- NEW: external encoder controls x-dependence ---
     ### I think it is good to use pretrained encoders and decoders for better representation power, 
@@ -582,22 +606,22 @@ def main():
     ap.add_argument("--latent_dim", type=int, default=64, help="latent dim (only used when --use_decoder)")
 
     # GMM settings
-    ap.add_argument("--num_modes", type=int, default=20) # plan to try 1,3,7,12,20 but for small model 
-    ap.add_argument("--cov_type", choices=["diag","full","lowrank"], default="diag")
-    ap.add_argument("--cov_rank", type=int, default=4)
+    ap.add_argument("--num_modes", type=int, default=3) # plan to try 1,3,7,12,20 but for small model 
+    ap.add_argument("--cov_type", choices=["diag","full","lowrank"], default="lowrank")
+    ap.add_argument("--cov_rank", type=int, default=8)
     ap.add_argument("--epochs", type=int, default=200) # 3 epochs for debug
-    ap.add_argument("--lr", type=float, default=2e-2) # 2e-2 when x independent, 5e-4 when x-dependent
-    ap.add_argument("--gamma", type=float, default=1/255) # 8/255 for Linf, 0.5 for L2
+    ap.add_argument("--lr", type=float, default=5e-4) # 2e-2 when x independent, 5e-4 when x-dependent
+    ap.add_argument("--gamma", type=float, default=4/255) # 8/255 for Linf, 0.5 for L2
     ap.add_argument("--mc", type=int, default=20, \
                     help="MC samples per image per step")
-    ap.add_argument("--xdep", default=False, action="store_true") # store true for test
+    ap.add_argument("--xdep", default=True, action="store_true") # store True for test
     ap.add_argument("--norm", choices=["l2","linf"], default="linf")
-    ap.add_argument("--batch_size", type=int, default=128) 
+    ap.add_argument("--batch_size", type=int, default=64) 
 
 
 
     args = ap.parse_args()
-    cfg_str = f"CE_{args.arch}_{args.dataset}_cov({args.cov_type})_L({args.norm}_{_slug_gamma(args.gamma)})_K({args.num_modes})"
+    cfg_str = f"CWlike_{args.arch}_{args.dataset}_cov({args.cov_type})_L({args.norm}_{_slug_gamma(args.gamma)})_K({args.num_modes})"
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
@@ -704,15 +728,6 @@ def main():
     fname = f"gmm_{cfg_str}.pt"
     save_path = os.path.join(save_root, fname)
 
-    head.save_package(
-        save_path,
-        encoder=encoder if args.xdep else None,         # x-independent → no encoder to store
-        decoder=decoder if args.use_decoder else None,  # only store when using a decoder
-        args=args,                                      # keep a light snapshot (backends/flags)
-        extra_meta={"note": "trained on clean-correct only"}
-    )
-    print(f"[save] GMM package -> {save_path}")
-
     _ = compute_pr_on_clean_correct_old(
             model,
             head,
@@ -725,12 +740,15 @@ def main():
             batch_indices=train_sel
         )
 
-    # ---------------- (Optional) Visualization ----------------
-    # viz_all(loader, head,
-    #         encoder if args.xdep else (feat_extractor if args.encoder_backend=="classifier" else None),
-    #         decoder, build_gmm, g_ball, args, out_shape,
-    #         save_dir="viz",
-    #         viz_batch_idx=None)
+
+    head.save_package(
+        save_path,
+        encoder=encoder if args.xdep else None,         # x-independent → no encoder to store
+        decoder=decoder if args.use_decoder else None,  # only store when using a decoder
+        args=args,                                      # keep a light snapshot (backends/flags)
+        extra_meta={"note": "trained on clean-correct only"}
+    )
+    print(f"[save] GMM package -> {save_path}")
 
 
 
