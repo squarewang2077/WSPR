@@ -5,9 +5,10 @@ import torchvision
 import torchvision.transforms as T
 from attacks import WithIndex
 from tqdm import tqdm
+from fit_classifiers import build_model as build_clf_model
 
 ### -------------------- Dataset -------------------- ###
-def get_dataset(name, root="./dataset", train=False):
+def get_dataset(name, root="./dataset", train=False, resize=False):
     """
     Get a dataset by name.
     Returns (dataset, num_classes, input_shape)
@@ -20,35 +21,52 @@ def get_dataset(name, root="./dataset", train=False):
     name = name.lower()
     if name == "cifar10":
         mean, std = (0.4914,0.4822,0.4465), (0.2023,0.1994,0.2010)
-        tf = T.Compose([T.ToTensor(), T.Normalize(mean,std)])
-        ds = WithIndex(torchvision.datasets.CIFAR10(root=root, train=train, download=True, transform=tf))
         
+        if resize:
+            tf = T.Compose([T.Resize(224),T.CenterCrop(224),T.ToTensor(),T.Normalize(mean,std)])
+            input_shape = (3,224,224)
+        else:
+            tf = T.Compose([T.ToTensor(), T.Normalize(mean,std)])
+            input_shape = (3,32,32)
+    
         num_classes = 10
-        input_shape = (3,32,32)
+        ds = WithIndex(torchvision.datasets.CIFAR10(root=root, train=train, download=True, transform=tf))    
 
     elif name == "cifar100":
         mean, std = (0.5071,0.4865,0.4409), (0.2673,0.2564,0.2762)
-        tf = T.Compose([T.ToTensor(), T.Normalize(mean,std)])
-        ds = WithIndex(torchvision.datasets.CIFAR100(root=root, train=train, download=True, transform=tf))
+        if resize:
+            tf = T.Compose([T.Resize(224),T.CenterCrop(224),T.ToTensor(),T.Normalize(mean,std)])
+            input_shape = (3,224,224)
+        else:
+            tf = T.Compose([T.ToTensor(), T.Normalize(mean,std)])
+            input_shape = (3,32,32)
 
         num_classes = 100
-        input_shape = (3,32,32)
+        ds = WithIndex(torchvision.datasets.CIFAR100(root=root, train=train, download=True, transform=tf))
 
     elif name == "mnist":
         mean, std = (0.1307,), (0.3081,)
-        tf = T.Compose([T.ToTensor(), T.Normalize(mean,std)])
-        ds = WithIndex(torchvision.datasets.MNIST(root=root, train=train, download=True, transform=tf))
+        if resize:
+            tf = T.Compose([T.Resize(224),T.CenterCrop(224),T.ToTensor(),T.Normalize(mean,std)])
+            input_shape = (1,224,224)
+        else:
+            tf = T.Compose([T.ToTensor(), T.Normalize(mean,std)])
+            input_shape = (1,28,28)
 
         num_classes = 10
-        input_shape = (1,28,28)
+        ds = WithIndex(torchvision.datasets.MNIST(root=root, train=train, download=True, transform=tf))
 
     elif name == "tinyimagenet":
         mean, std = (0.4802,0.4481,0.3975), (0.2302,0.2265,0.2262)
-        tf = T.Compose([T.Resize(64),T.CenterCrop(64),T.ToTensor(),T.Normalize(mean,std)])
-        ds = WithIndex(torchvision.datasets.ImageFolder(os.path.join(root,"tiny-imagenet-200","val"), transform=tf))
+        if resize:
+            tf = T.Compose([T.Resize(224),T.CenterCrop(224),T.ToTensor(),T.Normalize(mean,std)])
+            input_shape = (3,224,224)
+        else:
+            tf = T.Compose([T.Resize(64),T.CenterCrop(64),T.ToTensor(),T.Normalize(mean,std)])
+            input_shape = (3,64,64)
 
         num_classes = 200
-        input_shape = (3,64,64)
+        ds = WithIndex(torchvision.datasets.ImageFolder(os.path.join(root,"tiny-imagenet-200","val"), transform=tf))
 
     else: # raise error if unknown dataset
         raise ValueError(f"Unknown dataset {name}")
@@ -90,36 +108,39 @@ def build_model(arch: str, num_classes: int, device):
 
 
     arch = arch.lower()
-    if arch == "resnet18":
+    if arch == "resnet18": # this defaults to training from scratch
+        # There is a version of resize pretrained resnet18, but not considered here 
+        # it is from an old plan    
         model = torchvision.models.resnet18(weights=None, num_classes=num_classes)
         feat_extractor = nn.Sequential(*list(model.children())[:-1], nn.Flatten())
 
+    # from here all model are pretrained and finetuned
     elif arch == "resnet50":
-        model = torchvision.models.resnet50(weights=None, num_classes=num_classes)
+        model = build_clf_model(arch="resnet50", num_classes=num_classes, device=device, pretrained=False)
         feat_extractor = nn.Sequential(*list(model.children())[:-1], nn.Flatten())
 
     elif arch == "wide_resnet50_2":
-        model = torchvision.models.wide_resnet50_2(weights=None, num_classes=num_classes)
+        model = build_clf_model(arch="wide_resnet50_2", num_classes=num_classes, device=device, pretrained=False)
         feat_extractor = nn.Sequential(*list(model.children())[:-1], nn.Flatten())
 
     elif arch == "vgg16":
-        model = torchvision.models.vgg16(weights=None, num_classes=num_classes)
+        model = build_clf_model(arch="vgg16", num_classes=num_classes, device=device, pretrained=False)
         feat_extractor = nn.Sequential(model.features, model.avgpool, nn.Flatten())
 
     elif arch == "densenet121":
-        model = torchvision.models.densenet121(weights=None, num_classes=num_classes)
+        model = build_clf_model(arch="densenet121", num_classes=num_classes, device=device, pretrained=False)
         feat_extractor = nn.Sequential(model.features, nn.ReLU(inplace=True),
                                        nn.AdaptiveAvgPool2d((1,1)), nn.Flatten())
     elif arch == "mobilenet_v3_large":
-        model = torchvision.models.mobilenet_v3_large(weights=None, num_classes=num_classes)
+        model = build_clf_model(arch="mobilenet_v3_large", num_classes=num_classes, device=device, pretrained=False)
         feat_extractor = nn.Sequential(model.features, nn.AdaptiveAvgPool2d((1,1)), nn.Flatten())
 
     elif arch == "efficientnet_b0":
-        model = torchvision.models.efficientnet_b0(weights=None, num_classes=num_classes)
+        model = build_clf_model(arch="efficientnet_b0", num_classes=num_classes, device=device, pretrained=False)
         feat_extractor = nn.Sequential(model.features, nn.AdaptiveAvgPool2d((1,1)), nn.Flatten())
 
     elif arch == "vit_b_16":
-        model = torchvision.models.vit_b_16(weights=None, num_classes=num_classes)
+        model = build_clf_model(arch="vit_b_16", num_classes=num_classes, device=device, pretrained=False)
         class ViTFeat(nn.Module):
             def __init__(self, vit): 
                 super().__init__(); self.vit = vit

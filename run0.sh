@@ -16,16 +16,16 @@ export CUDA_VISIBLE_DEVICES=0
 #     done
 # done
 
-for num_modes in 20
+for num_modes in 7
 do
-    for gamma in  0.25 0.5 1.0
+    for gamma in  0.0627
     do
         echo "Running with gamma=$gamma"
         echo "Running with num_modes=$num_modes"
         python fit_gmm.py \
         --num_modes $num_modes \
         --gamma $gamma \
-        --norm l2 \
+        --norm linf \
         --xdep
     done
 done

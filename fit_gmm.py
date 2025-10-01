@@ -17,7 +17,7 @@ class GMM(nn.Module):
     """
     def __init__(self, feat_dim, K, latent_dim, xdep, cov_type, cov_rank):
         super().__init__()
-        self.K, self.D, self.xdep = K, latent_dim, xdep
+        self.K, self.latent_dim, self.xdep = K, latent_dim, xdep
         self.cov_type, self.r = cov_type, cov_rank
         hid = 512
 
@@ -55,21 +55,21 @@ class GMM(nn.Module):
             h = self.trunk(feat) # of size (B, hid_dim)
             pi = torch.softmax(self.pi_head(h), dim=-1) # pi is of size [B, K], self.pi_head(h) is of [B, K]
             B = h.size(0) # batch size
-            mu = self.mu_head(h).view(B, self.K, self.D) # mu is of size [B, K, D], D (latent dim) is CxHxW if no decoder
+            mu = self.mu_head(h).view(B, self.K, self.latent_dim) # mu is of size [B, K, D], D (latent dim) is CxHxW if no decoder
             if self.cov_type == "diag":
-                sigma = torch.exp(self.logsig_head(h).view(B, self.K, self.D)).clamp_min(1e-6) # for numerical stability
+                sigma = torch.exp(self.logsig_head(h).view(B, self.K, self.latent_dim)).clamp_min(1e-6) # for numerical stability
                 return pi, mu, sigma
             elif self.cov_type == "full":
-                L_raw = self.L_head(h).view(B, self.K, self.D, self.D)
+                L_raw = self.L_head(h).view(B, self.K, self.latent_dim, self.latent_dim)
                 L = torch.tril(L_raw)
                 diag = F.softplus(torch.diagonal(L, dim1=-2, dim2=-1)) + 1e-6
                 L = L.clone()
-                idx = torch.arange(self.D, device=L.device)
+                idx = torch.arange(self.latent_dim, device=L.device)
                 L[..., idx, idx] = diag
                 return pi, mu, L
             else:
-                U = self.U_head(h).view(B, self.K, self.D, self.r)
-                sigma = torch.exp(self.logsig_head(h).view(B, self.K, self.D)).clamp_min(1e-6)
+                U = self.U_head(h).view(B, self.K, self.latent_dim, self.r)
+                sigma = torch.exp(self.logsig_head(h).view(B, self.K, self.latent_dim)).clamp_min(1e-6)
                 return pi, mu, (U, sigma)
         else: # x-independent case (no feature input needed, here feat is only for batch size)
             B = feat.size(0) if feat is not None else 1
@@ -83,7 +83,7 @@ class GMM(nn.Module):
                 L = torch.tril(L_raw) # lower triangle matrix but only a view
                 diag = F.softplus(torch.diagonal(L, dim1=-2, dim2=-1)) + 1e-6
                 L = L.clone() # the new lower triangular matrix, avoiding inplace problem
-                idx = torch.arange(self.D, device=L.device)
+                idx = torch.arange(self.latent_dim, device=L.device)
                 L[..., idx, idx] = diag
                 return pi, mu, L
             else:
@@ -218,7 +218,7 @@ class GMM(nn.Module):
             decoder, eff_latent = None, out_shape[0]*out_shape[1]*out_shape[2]
 
         # NOTE: you instantiated this class with latent_dim == eff_latent
-        assert eff_latent == self.D, f"latent dim mismatch: decoder/pixel {eff_latent} vs GMM.D {self.D}"
+        assert eff_latent == self.latent_dim, f"latent dim mismatch: decoder/pixel {eff_latent} vs GMM.D {self.latent_dim}"
 
         params = list(self.parameters())
         if (args.encoder_backend != "classifier") and (not args.freeze_encoder): # train the external encoder if not frozen
@@ -309,7 +309,7 @@ class GMM(nn.Module):
         Returns (pr_mean, n_used, clean_acc).
 
         Notes:
-        - Uses self.xdep/self.cov_type/self.D 等结构属性。
+        - Uses self.xdep/self.cov_type/self.latent_dim 等结构属性。
         - encoder 仅在 self.xdep=True 时需要；其输出维度应匹配 self.trunk 的输入维度。
         - 当 use_decoder=False 时，latent 维度必须等于 C*H*W。
         """
@@ -423,7 +423,7 @@ class GMM(nn.Module):
         pkg["gmm_state"] = self.state_dict()
         pkg["gmm_config"] = {
             "K": self.K,
-            "D": self.D,
+            "D": self.latent_dim,
             "xdep": self.xdep,
             "cov_type": self.cov_type,
             "cov_rank": self.r,
@@ -525,6 +525,7 @@ class GMM(nn.Module):
         if cfg["xdep"]:
             if enc_backend is None:
                 raise RuntimeError("Missing encoder backend in package for x-dependent GMM.")
+
             # Rebuild encoder via factory; freeze according to saved flag
             freeze_enc = bool(enc_info.get("freeze_encoder", True))
             enc, feat_dim_chk = build_encoder_fn(enc_backend, out_shape, device, ckpt="", freeze=freeze_enc)
@@ -533,7 +534,7 @@ class GMM(nn.Module):
             if sd is not None:
                 enc.load_state_dict(sd, strict=False)
             if freeze_enc:
-                enc.eval()
+                if enc_backend != 'classifier': enc.eval()
         # else: x-independent → no encoder needed
 
         # ---- rebuild decoder (if used) ----
@@ -582,7 +583,7 @@ def main():
                     help="path to trained classifier checkpoint (required)")
     ap.add_argument("--device", default="cuda")
 
-    ap.add_argument("--batch_idx", type=str, default="0-40",
+    ap.add_argument("--batch_idx", type=str, default="0-160",
                     help="Which batch indices to TRAIN and compute PR on (e.g., '0', '0,3,5-10'). Empty=all.")
     # ap.add_argument("--viz_batch", type=int, default=-1,
     #                 help="Batch index for the PCA viz (-1 means first batch).")
@@ -596,32 +597,32 @@ def main():
     ap.add_argument("--freeze_encoder", action="store_true", default=True, help="freeze the external encoder") # store false for test
 
     # Decoder control
-    ap.add_argument("--use_decoder", action="store_true", default=False, \
-                    help="use decoder to map latent->image noise; else direct pixel latent") # store false for test
-    ap.add_argument("--decoder_backend", choices=["conv","biggan256"], default="biggan256", \
+    ap.add_argument("--use_decoder", action="store_true", default=True, \
+                    help="use decoder to map latent->image noise; else direct pixel latent") # store true for test
+    ap.add_argument("--decoder_backend", choices=["ae"], default="ae", \
                     help="choose decoder backend if --use_decoder")
     ap.add_argument("--freeze_decoder", action="store_true", default=True, help="freeze the decoder") # store false for test
     ap.add_argument("--gan_class", type=int, default=207)
     ap.add_argument("--gan_truncation", type=float, default=0.5)
-    ap.add_argument("--latent_dim", type=int, default=64, help="latent dim (only used when --use_decoder)")
+    ap.add_argument("--latent_dim", type=int, default=256, help="latent dim (only used when --use_decoder)")
 
     # GMM settings
-    ap.add_argument("--num_modes", type=int, default=3) # plan to try 1,3,7,12,20 but for small model 
-    ap.add_argument("--cov_type", choices=["diag","full","lowrank"], default="lowrank")
+    ap.add_argument("--num_modes", type=int, default=7) # plan to try 1,3,7,12,20 but for small model 
+    ap.add_argument("--cov_type", choices=["diag","full","lowrank"], default="full")
     ap.add_argument("--cov_rank", type=int, default=8)
     ap.add_argument("--epochs", type=int, default=200) # 3 epochs for debug
     ap.add_argument("--lr", type=float, default=5e-4) # 2e-2 when x independent, 5e-4 when x-dependent
-    ap.add_argument("--gamma", type=float, default=4/255) # 8/255 for Linf, 0.5 for L2
-    ap.add_argument("--mc", type=int, default=20, \
+    ap.add_argument("--gamma", type=float, default=8/255) # 8/255 for Linf, 0.5 for L2
+    ap.add_argument("--mc", type=int, default=10, \
                     help="MC samples per image per step")
     ap.add_argument("--xdep", default=True, action="store_true") # store True for test
     ap.add_argument("--norm", choices=["l2","linf"], default="linf")
-    ap.add_argument("--batch_size", type=int, default=64) 
+    ap.add_argument("--batch_size", type=int, default=32) 
 
 
 
     args = ap.parse_args()
-    cfg_str = f"CWlike_{args.arch}_{args.dataset}_cov({args.cov_type})_L({args.norm}_{_slug_gamma(args.gamma)})_K({args.num_modes})"
+    cfg_str = f"CWlike_{args.arch}_{args.dataset}_cov({args.cov_type})_L({args.norm}_{_slug_gamma(args.gamma)})_K({args.num_modes})_Dec({args.decoder_backend if args.use_decoder else 'pixel'})"
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
@@ -630,7 +631,7 @@ def main():
     # viz_idx   = None if (args.viz_batch is None or args.viz_batch < 0) else args.viz_batch
 
 
-    dataset, num_classes, out_shape = get_dataset(args.dataset, train=False)
+    dataset, num_classes, out_shape = get_dataset(args.dataset, train=False, resize=False) # always resize to 224 for imagenet pretrained encoders
     loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
     model, feat_extractor = build_model(args.arch, num_classes, device)
@@ -639,10 +640,12 @@ def main():
     if not args.clf_ckpt or not os.path.isfile(args.clf_ckpt):
         raise ValueError("You must provide --clf_ckpt pointing to a trained classifier on this dataset.")
     
-    state = torch.load(args.clf_ckpt, map_location="cpu", weights_only=False) # map_location for debug on my laptop
-    if "state_dict" in state: 
+    state = torch.load(args.clf_ckpt, map_location="cpu") # map_location for debug on my laptop
+    if "state_dict" in state: # this is for models that training from scratch
         # only leave the state dict in {"epoch": 10, "state_dict": model.state_dict(), "optimizer": opt.state_dict()}
         state = state["state_dict"]     
+    elif "model_state" in state: # pretrained models after finetuning
+        state = state["model_state"]
     state = {k.replace("module.",""): v for k,v in state.items()} # in case of dataparallel, trained with multi-gpu
     missing, unexpected = model.load_state_dict(state, strict=False) # check loading 
     print(f"[clf] loaded. missing={len(missing)} unexpected={len(unexpected)}")
@@ -717,13 +720,21 @@ def main():
 
     # save the loss history as Pandas dataframe for future analysis
     loss_df = pd.DataFrame(dict([(f"batch_{k}", v) for k,v in loss_hist.items()]))
-    os.makedirs("log/gmm_ckp/loss_hist", exist_ok=True)
-    loss_df.to_csv(os.path.join("log/gmm_ckp/loss_hist", cfg_str + ".csv"), index=False)
-    print(f"[save] loss history -> log/gmm_ckp/loss_hist/{cfg_str}.csv")
+    if args.use_decoder:
+        os.makedirs("log/gmm_ckp/loss_hist/dec", exist_ok=True)
+        loss_df.to_csv(os.path.join("log/gmm_ckp/loss_hist/dec", cfg_str + ".csv"), index=False)
+        print(f"[save] loss history -> log/gmm_ckp/loss_hist/dec/{cfg_str}.csv")
+    else:
+        os.makedirs("log/gmm_ckp/loss_hist", exist_ok=True)
+        loss_df.to_csv(os.path.join("log/gmm_ckp/loss_hist", cfg_str + ".csv"), index=False)
+        print(f"[save] loss history -> log/gmm_ckp/loss_hist/{cfg_str}.csv")
 
 
     # ---------------- Save the fitted GMM package ----------------
-    save_root = os.path.join("./log/gmm_ckp", "x_dep" if args.xdep else "x_indep")
+    if args.use_decoder:
+        save_root = os.path.join("./log/gmm_ckp", "x_dep/dec" if args.xdep else "x_indep/dec")
+    else:
+        save_root = os.path.join("./log/gmm_ckp", "x_dep" if args.xdep else "x_indep")
     os.makedirs(save_root, exist_ok=True)
     fname = f"gmm_{cfg_str}.pt"
     save_path = os.path.join(save_root, fname)
