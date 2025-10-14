@@ -583,7 +583,7 @@ def main():
                     help="path to trained classifier checkpoint (required)")
     ap.add_argument("--device", default="cuda")
 
-    ap.add_argument("--batch_idx", type=str, default="0-160",
+    ap.add_argument("--batch_idx", type=str, default="0-640",
                     help="Which batch indices to TRAIN and compute PR on (e.g., '0', '0,3,5-10'). Empty=all.")
     # ap.add_argument("--viz_batch", type=int, default=-1,
     #                 help="Batch index for the PCA viz (-1 means first batch).")
@@ -617,7 +617,7 @@ def main():
                     help="MC samples per image per step")
     ap.add_argument("--xdep", default=True, action="store_true") # store True for test
     ap.add_argument("--norm", choices=["l2","linf"], default="linf")
-    ap.add_argument("--batch_size", type=int, default=32) 
+    ap.add_argument("--batch_size", type=int, default=8) 
 
 
 

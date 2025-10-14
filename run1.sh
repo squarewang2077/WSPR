@@ -16,9 +16,9 @@ export CUDA_VISIBLE_DEVICES=1
 #     done
 # done
 
-for num_modes in 7
+for num_modes in 20
 do
-    for gamma in  1.0
+    for gamma in 0.25 0.5 1.0
     do
         echo "Running with gamma=$gamma"
         echo "Running with num_modes=$num_modes"
