@@ -5,4 +5,4 @@ dataset/*
 log/*
 model_zoo/*
 tmp/*
-
+ckp/*

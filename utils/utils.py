@@ -1,11 +1,13 @@
 import os
+import numpy as np
 import torch
 import torch.nn as nn
 import torchvision
 import torchvision.transforms as T
 from attacks import WithIndex
-from tqdm import tqdm
+import torch.nn.functional as F
 from fit_classifiers import build_model as build_clf_model
+
 
 ### -------------------- Dataset -------------------- ###
 def get_dataset(name, root="./dataset", train=False, resize=False):
@@ -105,7 +107,6 @@ def parse_batch_spec(spec):
 
 ### -------------------- Classifier factory -------------------- ###
 def build_model(arch: str, num_classes: int, device):
-
 
     arch = arch.lower()
     if arch == "resnet18": # this defaults to training from scratch
@@ -322,3 +323,397 @@ def compute_pr_on_clean_correct_old(
           f"(clean acc={clean_acc*100:.2f}%), S={S} → PR={pr:.4f}")
 
     return pr, total_used, clean_acc
+
+
+### Additional utility functions for the class of gmm4pr which is a advanced version ###
+def slug_gamma(g):
+    """Make gamma filename-safe."""
+    return f"{g:.4f}".replace('.', 'p')
+
+
+def initialize_gmm_parameters(gmm, init_mode='spread'): 
+    with torch.no_grad():
+        if hasattr(gmm, 'mu') and isinstance(gmm.mu, nn.Parameter):
+            K, D = gmm.mu.shape
+            
+            if init_mode == 'spread':
+                # Original binary pattern
+                gmm.mu.data.normal_(0, 0.5)
+                if K <= 8 and D >= 3:
+                    for k in range(min(K, 8)):
+                        binary = format(k, '03b')
+                        for d, bit in enumerate(binary):
+                            if d < D:
+                                gmm.mu.data[k, d] = 1.0 if bit == '1' else -1.0
+            
+            elif init_mode == 'random':
+                gmm.mu.data.normal_(0, 1.0)
+            
+            elif init_mode == 'grid':
+                # Evenly spaced grid
+                if D >= 2:
+                    side = int(np.ceil(K ** (1/2)))
+                    for k in range(K):
+                        i, j = k // side, k % side
+                        gmm.mu.data[k, 0] = (i / side) * 2 - 1
+                        gmm.mu.data[k, 1] = (j / side) * 2 - 1
+            
+            elif init_mode == 'uniform':
+                # Uniform in [-1, 1]
+                gmm.mu.data.uniform_(-1, 1)
+    
+    print(f"[init] GMM means initialized with mode='{init_mode}'")
+
+class TemperatureScheduler:
+    """Temperature scheduler."""
+    def __init__(self, gmm, initial_T_pi=2.0, final_T_pi=1.0, 
+                 initial_T_sigma=1.5, final_T_sigma=1.0,
+                 initial_T_shared=1.0, final_T_shared=1.0,
+                 warmup_epochs=50):
+        self.gmm = gmm
+        self.initial_T_pi = initial_T_pi
+        self.final_T_pi = final_T_pi
+        self.initial_T_sigma = initial_T_sigma
+        self.final_T_sigma = final_T_sigma
+        self.initial_T_shared = initial_T_shared
+        self.final_T_shared = final_T_shared
+        self.warmup_epochs = warmup_epochs
+        
+    def step(self, epoch):
+        """Update temperatures."""
+        if epoch <= self.warmup_epochs:
+            alpha = epoch / self.warmup_epochs
+            T_pi = self.initial_T_pi + alpha * (self.final_T_pi - self.initial_T_pi)
+            T_sigma = self.initial_T_sigma + alpha * (self.final_T_sigma - self.initial_T_sigma)
+            T_shared = self.initial_T_shared + alpha * (self.final_T_shared - self.initial_T_shared)
+        else:
+            T_pi = self.final_T_pi
+            T_sigma = self.final_T_sigma
+            T_shared = self.final_T_shared
+        
+        self.gmm.set_temperatures(T_pi=T_pi, T_sigma=T_sigma, T_shared=T_shared)
+        return T_pi, T_sigma, T_shared
+
+
+@torch.no_grad()
+def check_mode_collapse(gmm, loader, device, num_batches=10):
+    """Check mode collapse."""
+    gmm.eval()
+    pi_distributions = []
+    
+    for i, (x, y, _) in enumerate(loader):
+        if i >= num_batches:
+            break
+        x, y = x.to(device), y.to(device)
+        
+        out = gmm.forward(x=x, y=y)
+        pi_logits = out['cache']['pi_logits']
+        pi_probs = F.softmax(pi_logits, dim=-1)
+        pi_distributions.append(pi_probs.cpu())
+    
+    all_pi = torch.cat(pi_distributions, dim=0)
+    mean_pi = all_pi.mean(dim=0)
+    max_pi = mean_pi.max().item()
+    min_pi = mean_pi.min().item()
+    std_pi = mean_pi.std().item()
+    entropy = -(mean_pi * torch.log(mean_pi + 1e-8)).sum().item()
+    max_entropy = np.log(gmm.K)
+    
+    print(f"\n{'='*60}")
+    print(f"MODE COLLAPSE CHECK (K={gmm.K})")
+    print(f"{'='*60}")
+    print(f"Average π per component: {mean_pi.numpy()}")
+    print(f"Max π: {max_pi:.4f} | Min π: {min_pi:.4f} | Std: {std_pi:.4f}")
+    print(f"Entropy: {entropy:.4f} / {max_entropy:.4f} ({entropy/max_entropy*100:.1f}%)")
+    
+    if max_pi > 0.5:
+        print(f"⚠️  WARNING: Potential mode collapse!")
+    elif std_pi > 0.15:
+        print(f"⚠️  WARNING: High variance in usage")
+    else:
+        print(f"✓ Component usage looks balanced")
+    print(f"{'='*60}\n")
+    
+    gmm.train()
+    return {
+        'mean_pi': mean_pi.numpy(),
+        'max_pi': max_pi,
+        'min_pi': min_pi,
+        'std_pi': std_pi,
+        'entropy': entropy,
+        'entropy_ratio': entropy / max_entropy
+    }
+
+
+def build_decoder_from_flag(backend: str, latent_dim: int, out_shape: tuple, device):
+    """
+    Build decoder that maps latent_dim -> out_shape.
+    
+    Args:
+        backend: Decoder type ('bicubic', 'wavelet', 'dct', 'nearest_blur', 
+                                'conv', 'upsample', 'tiny', 'mlp')
+        latent_dim: Dimensionality of latent space
+        out_shape: Output shape (C, H, W)
+        device: Target device
+    
+    Returns:
+        decoder: nn.Module that maps [B, latent_dim] -> [B, C, H, W]
+    """
+    C, H, W = out_shape
+    
+    # Helper function to calculate adaptive sizes
+    def calc_init_size(target_size):
+        """Calculate initial spatial size for progressive upsampling."""
+        # Start from 4x4 or 7x7, whichever is more appropriate
+        if target_size <= 32:
+            return 4  # For CIFAR-10, MNIST, etc.
+        elif target_size <= 64:
+            return 7  # For 64x64 images
+        else:
+            return target_size // 32  # For larger images
+    
+    def calc_num_upsample_layers(init_size, target_size):
+        """Calculate number of 2x upsampling layers needed."""
+        num_layers = 0
+        current = init_size
+        while current < target_size:
+            current *= 2
+            num_layers += 1
+        return num_layers
+    
+    # ============ FROZEN DECODERS ============
+    if backend == "bicubic":
+        class BicubicDecoder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.init_size = calc_init_size(min(H, W))
+                init_dim = C * self.init_size * self.init_size
+                self.latent_to_spatial = nn.Linear(latent_dim, init_dim)
+            
+            def forward(self, z):
+                B = z.size(0)
+                h = self.latent_to_spatial(z)
+                h = h.view(B, C, self.init_size, self.init_size)
+                return F.interpolate(h, size=(H, W), mode='bicubic', align_corners=False)
+        
+        decoder = BicubicDecoder().to(device)
+        print(f"[Decoder 'bicubic'] {sum(p.numel() for p in decoder.parameters()):,} params (frozen decoder)")
+    
+    elif backend == "wavelet":
+        try:
+            import pywt
+            class SimpleWaveletDecoder(nn.Module):
+                def __init__(self, wavelet='haar'):
+                    super().__init__()
+                    self.wavelet = wavelet
+                    self.level = 2
+                    # Calculate size after wavelet decomposition
+                    h, w = H, W
+                    for _ in range(self.level):
+                        h = (h + 1) // 2
+                        w = (w + 1) // 2
+                    coeff_size = h * w * 4  # 4 subbands per level
+                    self.latent_to_coeffs = nn.Linear(latent_dim, coeff_size * C)
+                    self.coeff_h, self.coeff_w = h, w
+                
+                def forward(self, z):
+                    B = z.size(0)
+                    coeffs = self.latent_to_coeffs(z).view(B, C, self.coeff_h, self.coeff_w)
+                    # Use bilinear interpolation as approximation
+                    return F.interpolate(coeffs, size=(H, W), mode='bilinear', align_corners=False)
+            
+            decoder = SimpleWaveletDecoder().to(device)
+            print(f"[Decoder 'wavelet'] {sum(p.numel() for p in decoder.parameters()):,} params (frozen decoder)")
+        except ImportError:
+            print("Warning: pywt not found, falling back to bicubic")
+            return build_decoder_from_flag("bicubic", latent_dim, out_shape, device)
+    
+    elif backend == "dct":
+        class DCTDecoder(nn.Module):
+            def __init__(self, compression=4):
+                super().__init__()
+                self.compression = compression
+                dct_h, dct_w = max(1, H // compression), max(1, W // compression)
+                dct_size = C * dct_h * dct_w
+                self.latent_to_dct = nn.Linear(latent_dim, dct_size)
+                self.dct_h, self.dct_w = dct_h, dct_w
+            
+            def forward(self, z):
+                B = z.size(0)
+                dct = self.latent_to_dct(z).view(B, C, self.dct_h, self.dct_w)
+                return F.interpolate(dct, size=(H, W), mode='bilinear', align_corners=False)
+        
+        decoder = DCTDecoder().to(device)
+        print(f"[Decoder 'dct'] {sum(p.numel() for p in decoder.parameters()):,} params (frozen decoder)")
+    
+    elif backend == "nearest_blur":
+        class NearestBlurDecoder(nn.Module):
+            def __init__(self, blur_kernel=5):
+                super().__init__()
+                self.init_size = calc_init_size(min(H, W))
+                init_dim = C * self.init_size * self.init_size
+                self.latent_to_spatial = nn.Linear(latent_dim, init_dim)
+                
+                # Create Gaussian blur kernel
+                sigma = blur_kernel / 6.0
+                x = torch.arange(blur_kernel).float() - blur_kernel // 2
+                gauss = torch.exp(-x.pow(2) / (2 * sigma**2))
+                kernel_1d = gauss / gauss.sum()
+                kernel_2d = kernel_1d.unsqueeze(-1) @ kernel_1d.unsqueeze(0)
+                kernel = kernel_2d.expand(C, 1, blur_kernel, blur_kernel).contiguous()
+                self.register_buffer('blur_kernel', kernel)
+            
+            def forward(self, z):
+                B = z.size(0)
+                h = self.latent_to_spatial(z).view(B, C, self.init_size, self.init_size)
+                h = F.interpolate(h, size=(H, W), mode='nearest')
+                padding = self.blur_kernel.size(-1) // 2
+                return F.conv2d(h, self.blur_kernel, padding=padding, groups=C)
+        
+        decoder = NearestBlurDecoder().to(device)
+        print(f"[Decoder 'nearest_blur'] {sum(p.numel() for p in decoder.parameters()):,} params (frozen decoder)")
+    
+    # ============ TRAINABLE DECODERS ============
+    elif backend in ["conv", "convtranspose"]:
+        class ConvDecoder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # Adaptive architecture based on target size
+                target_size = max(H, W)
+                self.init_size = calc_init_size(target_size)
+                num_layers = calc_num_upsample_layers(self.init_size, target_size)
+                
+                # Initial projection
+                self.fc = nn.Linear(latent_dim, 256 * self.init_size * self.init_size)
+                
+                # Build upsampling layers dynamically
+                layers = []
+                in_ch = 256
+                for i in range(num_layers):
+                    out_ch = max(16, in_ch // 2)  # Halve channels, min 16
+                    layers.extend([
+                        nn.ConvTranspose2d(in_ch, out_ch, 4, 2, 1),
+                        nn.BatchNorm2d(out_ch),
+                        nn.ReLU(True),
+                    ])
+                    in_ch = out_ch
+                
+                # Final layer to match output channels
+                layers.append(nn.Conv2d(in_ch, C, 3, 1, 1))
+                self.decoder = nn.Sequential(*layers)
+            
+            def forward(self, z):
+                B = z.size(0)
+                h = self.fc(z).view(B, 256, self.init_size, self.init_size)
+                out = self.decoder(h)
+                # Adjust to exact target size if needed
+                if out.shape[2:] != (H, W):
+                    out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
+                return out
+        
+        decoder = ConvDecoder().to(device)
+        print(f"[Decoder 'conv'] {sum(p.numel() for p in decoder.parameters()):,} params (trainable)")
+    
+    elif backend == "upsample":
+        class UpsampleDecoder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                target_size = max(H, W)
+                self.init_size = calc_init_size(target_size)
+                num_layers = calc_num_upsample_layers(self.init_size, target_size)
+                
+                self.fc = nn.Linear(latent_dim, 256 * self.init_size * self.init_size)
+                
+                # Build upsampling layers
+                layers = []
+                in_ch = 256
+                for i in range(num_layers):
+                    out_ch = max(16, in_ch // 2)
+                    layers.extend([
+                        nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+                        nn.Conv2d(in_ch, out_ch, 3, padding=1),
+                        nn.BatchNorm2d(out_ch),
+                        nn.ReLU(True),
+                    ])
+                    in_ch = out_ch
+                
+                layers.append(nn.Conv2d(in_ch, C, 3, 1, 1))
+                self.decoder = nn.Sequential(*layers)
+            
+            def forward(self, z):
+                B = z.size(0)
+                h = self.fc(z).view(B, 256, self.init_size, self.init_size)
+                out = self.decoder(h)
+                if out.shape[2:] != (H, W):
+                    out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
+                return out
+        
+        decoder = UpsampleDecoder().to(device)
+        print(f"[Decoder 'upsample'] {sum(p.numel() for p in decoder.parameters()):,} params (trainable)")
+    
+    elif backend == "tiny":
+        class TinyDecoder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                target_size = max(H, W)
+                self.init_size = calc_init_size(target_size)
+                num_layers = calc_num_upsample_layers(self.init_size, target_size)
+                
+                self.fc = nn.Linear(latent_dim, 128 * self.init_size * self.init_size)
+                
+                # Minimal architecture
+                layers = []
+                in_ch = 128
+                for i in range(num_layers):
+                    out_ch = max(8, in_ch // 2)
+                    layers.extend([
+                        nn.ConvTranspose2d(in_ch, out_ch, 4, 2, 1),
+                        nn.ReLU(True),
+                    ])
+                    in_ch = out_ch
+                
+                layers.append(nn.Conv2d(in_ch, C, 3, 1, 1))
+                self.decoder = nn.Sequential(*layers)
+            
+            def forward(self, z):
+                B = z.size(0)
+                h = self.fc(z).view(B, 128, self.init_size, self.init_size)
+                out = self.decoder(h)
+                if out.shape[2:] != (H, W):
+                    out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
+                return out
+        
+        decoder = TinyDecoder().to(device)
+        print(f"[Decoder 'tiny'] {sum(p.numel() for p in decoder.parameters()):,} params (trainable)")
+    
+    elif backend in ["mlp", "linear"]:
+        out_dim = C * H * W
+        class LinearDecoder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # Adaptive hidden sizes based on output size
+                hidden1 = max(512, latent_dim * 4)
+                hidden2 = min(2048, out_dim // 2)
+                
+                self.net = nn.Sequential(
+                    nn.Linear(latent_dim, hidden1),
+                    nn.ReLU(True),
+                    nn.Linear(hidden1, hidden2),
+                    nn.ReLU(True),
+                    nn.Linear(hidden2, out_dim),
+                )
+            
+            def forward(self, z):
+                return self.net(z).view(z.size(0), C, H, W)
+        
+        decoder = LinearDecoder().to(device)
+        print(f"[Decoder 'mlp'] {sum(p.numel() for p in decoder.parameters()):,} params (trainable)")
+    
+    else:
+        raise ValueError(
+            f"Unknown decoder backend: '{backend}'. Choose from:\n"
+            f"  Frozen:    bicubic, wavelet, dct, nearest_blur\n"
+            f"  Trainable: conv, upsample, tiny, mlp"
+        )
+    
+    return decoder

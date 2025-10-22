@@ -394,7 +394,6 @@ class GMM(nn.Module):
         return pr_mean, total_used, clean_acc
 
 
-
     # -------------------- Save / Load package --------------------
     def save_package(self,
                      filepath: str,
