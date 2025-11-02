@@ -13,8 +13,8 @@ Usage:
     python train_gmm.py --list-configs
 """
 
-import json
 import os
+import random
 import argparse
 import numpy as np
 import torch
@@ -40,7 +40,7 @@ def main():
     parser = argparse.ArgumentParser(description="GMM4PR Training")
     
     # Config selection
-    parser.add_argument("--config", type=str, default="debug",
+    parser.add_argument("--config", type=str, default="resnet18_on_cifar10_linf_K3",
                        help="Config name from config.py")
     parser.add_argument("--list-configs", action="store_true", default=False, # false for debug
                        help="List all available configs and exit")
@@ -81,22 +81,28 @@ def main():
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     print(f"\nUsing device: {device}")
     
-    # Set random seed
-    torch.manual_seed(cfg.seed)
-    np.random.seed(cfg.seed)
+    # Set random seed for reproducibility
+    # random.seed(cfg.seed)
+    # np.random.seed(cfg.seed)
+    # torch.manual_seed(cfg.seed)
+    # if torch.cuda.is_available():
+    #     torch.cuda.manual_seed_all(cfg.seed)
+        # Note: Setting deterministic mode can slow down training significantly
+        # torch.backends.cudnn.deterministic = True
+        # torch.backends.cudnn.benchmark = False
     
     # Load dataset
     print(f"\nLoading dataset: {cfg.dataset}")
-    dataset, num_classes, out_shape = get_dataset(cfg.dataset, train=True, resize=True) # training set
+    dataset, num_classes, out_shape = get_dataset(cfg.dataset, cfg.data_root, train=True, resize=cfg.resize) # training set
     loader = torch.utils.data.DataLoader(
         dataset, 
         batch_size=cfg.batch_size,
-        shuffle=True, 
+        shuffle=False, 
         num_workers=cfg.num_workers, 
-        pin_memory=True
+        pin_memory=True 
     )
     print(f"Dataset: {len(dataset)} samples, {num_classes} classes, shape={out_shape}")
-    
+
     # ============ LOAD CLASSIFIER ============
     print(f"\nLoading classifier: {cfg.arch}")
     model, feat_extractor = build_model(cfg.arch, num_classes, device)
@@ -116,7 +122,7 @@ def main():
     feat_extractor = feat_extractor.to(device).eval()
     for p in feat_extractor.parameters():
         p.requires_grad = False
-    
+        
     # Check parameter sharing
     model_params = {id(p) for p in model.parameters()}
     feat_params  = {id(p) for p in feat_extractor.parameters()}
@@ -154,9 +160,7 @@ def main():
     # Set regularization
     gmm.set_regularization(
         pi_entropy=cfg.reg_pi_entropy,
-        # component_usage=cfg.reg_comp_usage,
         mean_diversity=cfg.reg_mean_div,
-        # kl_prior=cfg.reg_kl_prior
     )
     
     # Infer feature dimension if needed
@@ -202,10 +206,16 @@ def main():
         gmm,
         initial_T_pi=cfg.T_pi_init,
         final_T_pi=cfg.T_pi_final,
+
+        initial_T_mu=cfg.T_mu_init,
+        final_T_mu=cfg.T_mu_final,
+
         initial_T_sigma=cfg.T_sigma_init,
         final_T_sigma=cfg.T_sigma_final,
+
         initial_T_shared=cfg.T_shared_init,
         final_T_shared=cfg.T_shared_final,
+
         warmup_epochs=cfg.warmup_epochs
     )
     
@@ -215,14 +225,50 @@ def main():
         lr=cfg.lr,
         weight_decay=cfg.weight_decay
     )
-    
+
+    # ============ LEARNING RATE SCHEDULER ============
+    scheduler = None
+    if cfg.use_lr_scheduler:
+        # Cosine Annealing with Warmup
+        # We'll use CosineAnnealingLR and manually handle warmup
+        from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+
+        # Warmup scheduler: linearly increase LR from 0 to initial LR
+        warmup_scheduler = LinearLR(
+            optimizer,
+            start_factor=0.01,  # Start at 1% of initial LR
+            end_factor=1.0,     # End at 100% of initial LR
+            total_iters=cfg.lr_warmup_epochs
+        )
+
+        # Cosine annealing scheduler: decrease LR from initial to min
+        cosine_scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=cfg.epochs - cfg.lr_warmup_epochs,  # Remaining epochs after warmup
+            eta_min=cfg.lr_min
+        )
+
+        # Combine warmup and cosine annealing
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[cfg.lr_warmup_epochs]
+        )
+
+        print(f"\nLearning rate scheduler enabled:")
+        print(f"  Warmup epochs: {cfg.lr_warmup_epochs}")
+        print(f"  Initial LR: {cfg.lr}")
+        print(f"  Min LR: {cfg.lr_min}")
+
     # ============ TRAINING LOOP ============
     os.makedirs(cfg.ckp_dir, exist_ok=True)
     collapse_log = []
-    loss_hist = {"epoch": [], 
+    loss_hist = {"epoch": [],
                  "loss": [],
                  "main_loss": [],
-                 "reg_loss": []
+                 "reg_loss": [],
+                 "pr": [],
+                 "learning_rate": []
                  } # To store loss history
 
     gmm.train()
@@ -232,27 +278,33 @@ def main():
     
     for epoch in range(1, cfg.epochs + 1):
         # Update temperatures for distribution parameters
-        T_pi, T_sigma, T_shared = temp_scheduler.step(epoch)
+        T_pi, T_mu, T_sigma, T_shared = temp_scheduler.step(epoch)
         
         # Compute Gumbel temperature (optional annealing)
         if hasattr(cfg, 'use_gumbel_anneal') and cfg.use_gumbel_anneal:
-            alpha = epoch / cfg.epochs
+            alpha = (epoch - 1) / (cfg.epochs - 1)
             gumbel_temp = cfg.gumbel_temp_init + alpha * (cfg.gumbel_temp_final - cfg.gumbel_temp_init)
         else:
-            gumbel_temp = 1.0  # Fixed temperature
+            gumbel_temp = cfg.gumbel_temp_final  # Fixed temperature
         
         # Progress bar
-        pbar = tqdm(loader, desc=f"Epoch {epoch}/{cfg.epochs} [T_π={T_pi:.2f}, T_g={gumbel_temp:.2f}]")
+        pbar = tqdm(loader, desc=f"Epoch {epoch}/{cfg.epochs} [norm={cfg.norm}, eps={cfg.epsilon:.3f}]")
         
         # Metrics
         epoch_loss = 0.0
         epoch_main = 0.0
         epoch_reg = 0.0
+        epoch_pr = 0.0
+        epoch_pr_count = 0  # Track total samples for PR calculation
         total_samples = 0
-        
+        num_processed_batches = 0 # to account for skipped batches
+
+        acc_counter = 0
         optimizer.zero_grad(set_to_none=True)
         
         for batch_idx, (x, y, _) in enumerate(pbar):
+            if batch_idx >= cfg.batch_index_max: # this line added for testing 
+                break
             x, y = x.to(device), y.to(device)
             
             # Only use correctly classified samples
@@ -265,23 +317,26 @@ def main():
             
             x_clean, y_clean = x[mask], y[mask]
             total_samples += len(y_clean)
-            
-            # Compute loss
-            return_details = (batch_idx == 0 and epoch % cfg.check_collapse_every == 0)
+            num_processed_batches += 1
+
+            # Compute loss (return details on first processed batch of checkpoint epochs)
+            return_details = (num_processed_batches == 1 and epoch % cfg.check_collapse_every == 0)
             
             out = gmm.pr_loss(
                 x_clean, y_clean, model,
                 num_samples=cfg.num_samples,
+                loss_variant=cfg.loss_variant, kappa=cfg.kappa,
                 chunk_size=cfg.chunk_size,
-                gumbel_temperature=gumbel_temp,  # Pass Gumbel temperature
-                return_reg_details=return_details
+                return_reg_details=return_details,
+                gumbel_temperature=gumbel_temp  # Pass Gumbel temperature
             )
             
             loss = out["loss"] / cfg.accumulate_grad
             loss.backward()
-            
+            acc_counter += 1
+
             # Gradient step
-            if (batch_idx + 1) % cfg.accumulate_grad == 0:
+            if acc_counter % cfg.accumulate_grad == 0:
                 if cfg.grad_clip > 0:
                     nn.utils.clip_grad_norm_(gmm.parameters(), cfg.grad_clip)
                 optimizer.step()
@@ -291,6 +346,8 @@ def main():
             epoch_loss += out["loss"].item()
             epoch_main += out["main"].item()
             epoch_reg += out["reg"].item()
+            epoch_pr += out["pr"] * len(y_clean)  # Weight by batch size
+            epoch_pr_count += len(y_clean)  # Track total samples
             
             # Print regularization details
             if return_details and 'reg_details' in out:
@@ -301,33 +358,45 @@ def main():
             
             # Update progress bar
             pbar.set_postfix({
-                "loss": f"{out['loss'].item():.4f}",
-                "main": f"{out['main'].item():.4f}",
-                "reg": f"{out['reg'].item():.4f}",
+                "loss": f"{out['loss'].item():.4e}",
+                "main": f"{out['main'].item():.4e}",
+                "reg": f"{out['reg'].item():.4e}",
             })
         
         # Final gradient step
-        if len(loader) % cfg.accumulate_grad != 0:
+        if acc_counter % cfg.accumulate_grad != 0:
             if cfg.grad_clip > 0:
                 nn.utils.clip_grad_norm_(gmm.parameters(), cfg.grad_clip)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
         
         # Epoch summary
-        avg_loss = epoch_loss / max(len(loader), 1)
-        avg_main = epoch_main / max(len(loader), 1)
-        avg_reg = epoch_reg / max(len(loader), 1)
-        
+        avg_loss = epoch_loss / max(num_processed_batches, 1)
+        avg_main = epoch_main / max(num_processed_batches, 1)
+        avg_reg = epoch_reg / max(num_processed_batches, 1)
+        avg_pr = epoch_pr / max(epoch_pr_count, 1)  # Divide by total samples, not batches
+
+        # Get current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+
         # Record loss history
         loss_hist["epoch"].append(epoch)
         loss_hist["loss"].append(avg_loss)
         loss_hist["main_loss"].append(avg_main)
         loss_hist["reg_loss"].append(avg_reg)
+        loss_hist["pr"].append(avg_pr)
+        loss_hist["learning_rate"].append(current_lr)
 
         print(f"\nEpoch {epoch} Summary:")
         print(f"  Loss: {avg_loss:.4f} (main={avg_main:.4f}, reg={avg_reg:.4f})")
+        print(f"  Learning Rate: {current_lr:.6f}")
+        print(f"  Batches: {num_processed_batches}/{len(loader)} processed")
         print(f"  Samples used: {total_samples}/{len(dataset)}")
-        print(f"  Temperatures: T_π={T_pi:.2f}, T_σ={T_sigma:.2f}, T_gumbel={gumbel_temp:.2f}")
+        print(f"  Temperatures: T_pi={T_pi:.2f}, T_mu={T_mu:.2f}, T_sigma={T_sigma:.2f}, T_shared={T_shared:.2f}, T_gumbel={gumbel_temp:.2f}")
+
+        # Step the learning rate scheduler
+        if scheduler is not None:
+            scheduler.step()
         
         # Check mode collapse
         if epoch % cfg.check_collapse_every == 0:
@@ -342,22 +411,14 @@ def main():
                 'T_gumbel': gumbel_temp,
                 'avg_loss': avg_loss
             })
-            
-            # Adaptive regularization
-            if stats['max_pi'] > 0.6 and epoch < cfg.epochs * 0.8:
-                print("⚠️  Mode collapse detected! Increasing regularization...")
-                gmm.set_regularization(
-                    pi_entropy=gmm.reg_coeffs['pi_entropy'] * 1.5,
-                    component_usage=gmm.reg_coeffs['component_usage'] * 1.5
-                )
-    
-    # ============ SAVE ============
+
+    # ======= SAVE ============
     print(f"\n{'='*60}")
     print("Training complete! Saving model...")
     print(f"{'='*60}")
     
     # saving directory
-    save_dir = cfg.ckp_dir
+    save_dir = f"{cfg.ckp_dir}/{cfg.arch}_on_{cfg.dataset}/"
     os.makedirs(save_dir, exist_ok=True)
 
     # save the training loss

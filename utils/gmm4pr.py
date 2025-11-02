@@ -36,7 +36,7 @@ class GMM4PR(nn.Module):
         self.logstd_bounds = logstd_bounds
         self.budget = {"norm": "linf", "eps": 8/255}
 
-        # Regularization coefficients
+        # Regularization coefficients with default values
         self.reg_coeffs = {
             'pi_entropy': 0.01,
             # 'component_usage': 0.001,
@@ -106,8 +106,8 @@ class GMM4PR(nn.Module):
         self.cov_rank = cov_rank
 
         if cond_mode is None: # unconditional GMM
-            self.pi = nn.Parameter(torch.zeros(self.K)).to(self.device)
-            self.mu = nn.Parameter(torch.zeros(self.K, self.latent_dim)).to(self.device)
+            self.pi = nn.Parameter(torch.randn(self.K, device=self.device) * 0.01) 
+            self.mu = nn.Parameter(torch.zeros(self.K, self.latent_dim, device=self.device))
             self._init_cov_params(cov_type, cov_rank)
 
         elif cond_mode == "x":
@@ -138,7 +138,7 @@ class GMM4PR(nn.Module):
             self.pi = self._make_head(y_dim, self.K)
 
             # unconditional mu and Sigma
-            self.mu = nn.Parameter(torch.zeros(self.K, self.latent_dim)).to(self.device)
+            self.mu = nn.Parameter(torch.zeros(self.K, self.latent_dim, device=self.device))
             self._init_cov_params(cov_type, cov_rank)
 
         else:
@@ -146,22 +146,35 @@ class GMM4PR(nn.Module):
             
         # Count parameters
         total_params = sum(p.numel() for p in self.parameters())
-        if self.shared_trunk is not None:
+        if self.cond_mode in ["x", "xy"]:
             trunk_params = sum(p.numel() for p in self.shared_trunk.parameters())
-        pi_params = sum(p.numel() for p in self.pi.parameters())
-        mu_params = sum(p.numel() for p in self.mu.parameters())
-        cov_params = total_params - trunk_params - pi_params - mu_params
+            pi_params = sum(p.numel() for p in self.pi.parameters())
+            mu_params = sum(p.numel() for p in self.mu.parameters())
+
+        elif self.cond_mode == "y":
+            trunk_params = 0
+            pi_params = sum(p.numel() for p in self.pi.parameters())
+            mu_params = self.mu.numel()
+        
+        else: # unconditional
+            trunk_params = 0
+            pi_params = self.pi.numel()
+            mu_params = self.mu.numel()
+
+        cov_params = total_params - pi_params - mu_params
         print(f"[Params] Shared trunk: {trunk_params:,} | pi: {pi_params:,} | mu: {mu_params:,}, | cov: {cov_params:,} | Total: {total_params:,}")
 
     def _init_cov_params(self, cov_type, cov_rank):
         """Initialize unconditional covariance parameters."""
         if cov_type == "diag": # [K, D]
-            self.log_sigma = nn.Parameter(torch.zeros(self.K, self.latent_dim)).to(self.device)
+            self.log_sigma = nn.Parameter(torch.zeros(self.K, self.latent_dim, device=self.device))
+
         elif cov_type == "lowrank": # [K, D] and [K, D, r]
-            self.log_sigma = nn.Parameter(torch.zeros(self.K, self.latent_dim)).to(self.device)
-            self.U = nn.Parameter(torch.zeros(self.K, self.latent_dim, cov_rank)).to(self.device)
+            self.log_sigma = nn.Parameter(torch.zeros(self.K, self.latent_dim, device=self.device))
+            self.U = nn.Parameter(torch.zeros(self.K, self.latent_dim, cov_rank, device=self.device))
+
         elif cov_type == "full": # [K, D, D]
-            self.L_raw = nn.Parameter(torch.zeros(self.K, self.latent_dim, self.latent_dim)).to(self.device)
+            self.L_raw = nn.Parameter(torch.zeros(self.K, self.latent_dim, self.latent_dim, device=self.device))
         else:
             raise ValueError(f"cov_type must be diag/full/lowrank, got {cov_type}")
 
@@ -186,8 +199,6 @@ class GMM4PR(nn.Module):
     def set_up_sampler(self, up_sampler): 
         """Set frozen decoder."""
         self.up_sampler = up_sampler.to(self.device)
-        for p in self.up_sampler.parameters():
-            p.requires_grad = False
 
     def set_budget(self, norm="linf", eps=8/255):
         """Set perturbation budget."""
@@ -261,6 +272,8 @@ class GMM4PR(nn.Module):
     def _decode_latent(self, eps, out_shape):
         """Map latent eps to image-shaped u."""
         if self.up_sampler is None:
+            assert eps.size(-1) == np.prod(out_shape), \
+                f"Latent vector size {eps.size(-1)} does not match output shape {out_shape}"
             return eps.view(eps.shape[:-1] + out_shape)
 
         if eps.dim() == 2: # for no batch or single sample
@@ -408,11 +421,11 @@ class GMM4PR(nn.Module):
         else:
             L_raw = self.L_raw.unsqueeze(0).expand(B, K, D, D)
 
-        tril_mask = torch.tril(torch.ones(D, D, device=h_shared.device, dtype=torch.bool))
+        tril_mask = torch.tril(torch.ones(D, D, device=self.device, dtype=torch.bool))
         L = torch.zeros_like(L_raw)
         L[..., tril_mask] = L_raw[..., tril_mask]
-        
-        diag_idx = torch.arange(D, device=h_shared.device)
+
+        diag_idx = torch.arange(D, device=self.device)
         L[..., diag_idx, diag_idx] = F.softplus(L[..., diag_idx, diag_idx]) + 1e-4
         
         return L
@@ -427,34 +440,35 @@ class GMM4PR(nn.Module):
         # Pi entropy
         pi_probs = F.softmax(pi_logits, dim=-1)
         pi_entropy = Categorical(probs=pi_probs).entropy()
-        norm_entropy_loss = (1.0 - pi_entropy / torch.log(torch.tensor(pi_probs.size(-1), dtype=torch.float32))).mean()
+        norm_entropy_loss = (1.0 - pi_entropy / torch.log(torch.tensor(pi_probs.size(-1), dtype=torch.float32)))
 
         reg_terms['pi_entropy'] = norm_entropy_loss.mean() # minimize it encourages more spread pi
 
-        # # Component usage, not so promising, too directly encourage uniform usage and duplicated with entropy
-        # avg_pi = pi_probs.mean(dim=0) # the average pi over the batch 
-        # target_usage = 1.0 / K
-        # usage_penalty = F.mse_loss(avg_pi, torch.full_like(avg_pi, target_usage))
-        # reg_terms['component_usage'] = usage_penalty # avoid collapsing to few components, encourage pi_k to 1/K
-
         # Mean diversity
-        mu_batch_avg = mu.mean(dim=0) # mean over batch of size [B, K, D] -> [K, D]
-        mu_expanded1 = mu_batch_avg.unsqueeze(1) # [K, 1, D]
-        mu_expanded2 = mu_batch_avg.unsqueeze(0) # [1, K, D]
-        pairwise_dist = torch.norm(mu_expanded1 - mu_expanded2, dim=-1) # [K, K]
-        
-        mask = ~torch.eye(K, dtype=torch.bool, device=mu.device) # mask to exclude diagonal
-        min_dist = 0.5 
-        diversity_loss = F.softmax(min_dist - pairwise_dist[mask]).mean() # hinge loss: penalize pairs that are closer than min_dist
-        reg_terms['mean_diversity'] = diversity_loss
+        # mu: [B, K, D]
+        K = mu.size(1)
 
-        # # KL prior, may conflict with mean diversity
-        # if 'log_std' in cache:
-        #     log_std = cache['log_std']
-        #     mu_sq = (mu ** 2).mean()
-        #     var = torch.exp(2 * log_std).mean()
-        #     kl_prior = 0.5 * (mu_sq + var - 1 - 2 * log_std.mean())
-        #     reg_terms['kl_prior'] = kl_prior # KL for each component to standard normal
+        # 1) Normalization：care about diversity
+        mu_hat = F.normalize(mu, p=2, dim=-1, eps=1e-8)  # [B, K, D]
+
+        # 2) Gram matrix + stabilization
+        gram = torch.bmm(mu_hat, mu_hat.transpose(1, 2))  # [B, K, K]
+        gram = gram + 1e-6 * torch.eye(K, device=mu.device, dtype=gram.dtype).unsqueeze(0)
+
+        # 3) Stable log determinant
+        sign, logabsdet = torch.linalg.slogdet(gram)  # [B], [B]
+
+        # 5) Diversity loss（maximal volume = minimal log det）
+        target_diversity = torch.log(torch.tensor(float(K), device=mu.device))
+        diversity_loss = F.relu(target_diversity - logabsdet).mean() # make it non-negative
+
+
+        # (Optional) Check during debugging
+        if self.training and torch.rand(1).item() < 0.05:  # 5% chance to check
+            if (sign < 0).any():
+                print(f"[Warning] Negative det: sign={sign.min().item()}")
+
+        reg_terms['mean_diversity'] = diversity_loss
 
         return reg_terms
 
@@ -488,6 +502,7 @@ class GMM4PR(nn.Module):
         
         # Add to logits and apply softmax with temperature
         logits_with_gumbel = (pi_logits.unsqueeze(0) + gumbel_noise) / temperature
+        
         soft_component_weights = F.softmax(logits_with_gumbel, dim=-1)  # [S, B, K], doing on the K dimension
         
         # ============ STEP 2: Reparameterized Gaussian sampling ============
@@ -547,12 +562,10 @@ class GMM4PR(nn.Module):
         # ============ STEP 3: Weighted combination using soft weights ============
         # Expand weights: [S, B, K] -> [S, B, K, 1]
         weights = soft_component_weights.unsqueeze(-1)
-        
         # Weighted sum over components: [S, B, K, D] * [S, B, K, 1] -> [S, B, D]
         samples = (component_samples * weights).sum(dim=2)
         
         return samples
-
 
     def _sample_and_classify(self, x, num_samples, classifier, cache, temperature=1.0):
         """
@@ -578,7 +591,7 @@ class GMM4PR(nn.Module):
         
         # Project to budget
         delta = self._project_to_budget(u)
-        
+        # delta.view(delta.shape[0], delta.shape[1], -1).norm(p=2, dim=-1, keepdim=True)
         # Replicate clean images for broadcasting
         x_rep = x.unsqueeze(0).expand_as(delta)
         
@@ -596,6 +609,8 @@ class GMM4PR(nn.Module):
                 chunk_size=None, return_reg_details=False, gumbel_temperature=1.0):
         """Compute loss with regularization."""
         out = self.forward(x=x, y=y)
+        # self.out_test = out  # for debugging
+
         cache = out["cache"]
         B = x.size(0)
 
@@ -620,18 +635,18 @@ class GMM4PR(nn.Module):
             
             logits = torch.cat(logits_list, dim=0)
 
+        logits = logits - logits.max(dim=-1, keepdim=True).values  # shift-invariant; avoids huge magnitudes
         # Main loss
         if loss_variant == "cw":
-            probits = F.softmax(logits, dim=-1)
-            pro_or_log = probits
-
+            # Carlini-Wagner loss: minimize margin between correct class and best other class
             y_rep = y.unsqueeze(0).expand(num_samples, -1)
-            logit_y = pro_or_log.gather(-1, y_rep.unsqueeze(-1)).squeeze(-1)
-            mask = F.one_hot(y_rep, pro_or_log.size(-1)).bool()
-            max_others = pro_or_log.masked_fill(mask, float("-inf")).max(-1).values
+            logit_y = logits.gather(-1, y_rep.unsqueeze(-1)).squeeze(-1)
+            mask = F.one_hot(y_rep, logits.size(-1)).bool()
+            max_others = logits.masked_fill(mask, float("-inf")).max(-1).values
 
             margin = logit_y - max_others + kappa
-            main_loss = F.softplus(margin).mean() # use softplus for smooth approximation of ReLU
+            # main_loss = F.softplus(margin).mean()
+            main_loss = F.softplus(margin).mean()
 
         else:
             main_loss = 1 - F.cross_entropy(
@@ -645,8 +660,13 @@ class GMM4PR(nn.Module):
 
         total_loss = main_loss + total_reg
 
+        # running PR metrics - using canonical compute_pr() method
+        predictions = logits.argmax(dim=-1)  # [num_samples, B]
+        pr = self.compute_pr(predictions, y, reduction='mean').item()
+
         result = {
-            "loss": total_loss, 
+            "pr": pr,
+            "loss": total_loss,
             "main": main_loss.detach(),
             "reg": total_reg.detach(),
         }
@@ -656,6 +676,176 @@ class GMM4PR(nn.Module):
             result["pi_probs"] = F.softmax(cache['pi_logits'], dim=-1).mean(dim=0).detach()
         
         return result
+
+    @staticmethod
+    def compute_pr(predictions, y, reduction='mean'):
+        """
+        Compute Probabilistic Robustness from predictions.
+
+        This is the canonical PR computation method. All other PR calculations
+        should use this method to ensure consistency.
+
+        Args:
+            predictions: [S, B] or [S*B] predicted labels
+                        S = number of samples per image
+                        B = batch size (number of images)
+            y: [B] ground truth labels
+            reduction: 'mean' | 'sum' | 'none'
+                      - 'mean': return scalar average PR across all images
+                      - 'sum': return sum of per-image PR
+                      - 'none': return per-image PR values
+
+        Returns:
+            pr: Scalar (if reduction='mean'/'sum') or [B] tensor (if reduction='none')
+
+        """
+        # Ensure consistent shape
+        if predictions.dim() == 1:
+            # Flat format [S*B] -> reshape to [S, B]
+            S_times_B = predictions.size(0)
+            B = y.size(0)
+            if S_times_B % B != 0:
+                raise ValueError(f"predictions size {S_times_B} not divisible by y size {B}")
+            S = S_times_B // B
+            predictions = predictions.view(S, B)
+        elif predictions.dim() == 2:
+            S, B = predictions.shape
+            if y.size(0) != B:
+                raise ValueError(f"predictions batch size {B} != y size {y.size(0)}")
+        else:
+            raise ValueError(f"predictions must be 1D or 2D, got shape {predictions.shape}")
+
+        # Expand y: [B] -> [S, B]
+        y_expanded = y.unsqueeze(0).expand(S, -1)
+
+        # Compute success indicator: [S, B]
+        success = predictions.eq(y_expanded).float()
+
+        # Compute per-image success rate: [B]
+        per_image_pr = success.mean(dim=0)
+
+        # Handle deprecated per_sample parameter
+
+        # Apply reduction
+        if reduction == 'mean':
+            return per_image_pr.mean()
+        elif reduction == 'sum':
+            return per_image_pr.sum()
+        elif reduction == 'none':
+            return per_image_pr
+        else:
+            raise ValueError(f"Unknown reduction: {reduction}. Use 'mean', 'sum', or 'none'.")
+
+    @torch.no_grad()
+    def evaluate_pr(self, x, y, classifier, num_samples=100,
+                    use_soft_sampling=False, temperature=1.0, reduction='none',
+                    chunk_size=None):
+        """
+        Evaluate Probabilistic Robustness on a batch of images.
+
+        This is the unified evaluation method that works consistently for both
+        hard (categorical) and soft (Gumbel-Softmax) sampling. Supports chunking
+        for memory efficiency with large num_samples.
+
+        Args:
+            x: Images [B, C, H, W]
+            y: Labels [B]
+            classifier: Classifier model (should be in eval mode)
+            num_samples: Number of samples per image
+            use_soft_sampling: If True, use Gumbel-Softmax (_rsample_from_gmm).
+                              If False, use hard categorical sampling (dist.sample).
+            temperature: Temperature for Gumbel-Softmax (only used if use_soft_sampling=True)
+            reduction: 'mean' | 'sum' | 'none' - how to reduce per-image PR values
+            chunk_size: Maximum samples to process at once. If None, uses adaptive chunking.
+                       Useful for large num_samples to avoid OOM errors.
+
+        Returns:
+            If reduction='none': [B] per-image PR values
+            If reduction='mean': scalar mean PR
+            If reduction='sum': scalar sum of PR
+
+        """
+        B = x.size(0)
+
+        # Adaptive chunking (same logic as pr_loss)
+        if chunk_size is None:
+            max_batch = 32
+            chunk_size = max(1, max_batch // B)
+
+        # Process with chunking if needed
+        if num_samples <= chunk_size:
+            # No chunking needed - process all samples at once
+            predictions = self._evaluate_chunk(
+                x, y, num_samples, classifier,
+                use_soft_sampling, temperature)
+        else:
+            # Chunking for memory efficiency
+            predictions_list = []
+            num_chunks = (num_samples + chunk_size - 1) // chunk_size
+
+            for i in range(num_chunks):
+                chunk_samples = min(chunk_size, num_samples - i * chunk_size)
+                predictions_chunk = self._evaluate_chunk(
+                    x, y, chunk_samples, classifier,
+                    use_soft_sampling, temperature)
+                predictions_list.append(predictions_chunk)
+
+            # Concatenate all chunks: list of [S_i, B] -> [S_total, B]
+            predictions = torch.cat(predictions_list, dim=0)
+
+        # Compute PR using the canonical method
+        pr = self.compute_pr(predictions, y, reduction=reduction)
+
+        return pr
+
+    def _evaluate_chunk(self, x, y, num_samples, classifier,
+                       use_soft_sampling, temperature):
+        """
+        Helper method to evaluate a chunk of samples.
+
+        Args:
+            x: Images [B, C, H, W]
+            forward_out: Output from forward() containing dist and cache
+            num_samples: Number of samples for this chunk
+            classifier: Classifier model
+            use_soft_sampling: Whether to use Gumbel-Softmax
+            temperature: Temperature for Gumbel-Softmax
+            out_shape: Output shape (C, H, W)
+
+        Returns:
+            predictions: [num_samples, B] predicted labels
+        """
+        B = x.size(0)
+
+        # Build distribution once (reused across chunks)
+        forward_out = self.forward(x=x, y=y)
+
+        # Sample perturbations (using the appropriate method)
+        if use_soft_sampling:
+            # Use Gumbel-Softmax (differentiable, used during training)
+            cache = forward_out["cache"]
+            eps = self._rsample_from_gmm(cache, num_samples, temperature=temperature)
+        else:
+            # Use hard categorical sampling (true GMM distribution)
+            dist = forward_out["dist"]
+            eps = dist.sample((num_samples,))
+
+        # Decode latent to image space
+        u = self._decode_latent(eps, out_shape=x.shape[1:])
+
+        # Project to perturbation budget
+        delta = self._project_to_budget(u)
+
+        # Apply perturbations and classify
+        x_rep = x.unsqueeze(0).expand_as(delta)  # [S, B, C, H, W]
+
+        # Flatten and classify: [S, B, C, H, W] -> [S*B, C, H, W]
+        logits = classifier((x_rep + delta).flatten(0, 1))  # [S*B, num_classes]
+
+        # Get predictions: [S*B] -> [S, B]
+        predictions = logits.argmax(dim=-1).view(num_samples, B)
+
+        return predictions
 
     @torch.no_grad()
     def sample(self, x=None, y=None, num_samples=1, out_shape=None, chunk_size=None):
@@ -775,8 +965,8 @@ class GMM4PR(nn.Module):
             cov_type=self.cov_type,
             cov_rank=self.cov_rank, 
             feat_dim=self.feat_dim,
-            num_cls=self.num_cls,
-            hidden_dim=self.hidden_dim,  # ADDED: Missing parameter
+            num_cls=self.num_cls, 
+            hidden_dim=self.hidden_dim,  
         )
         if extra:
             cfg.update(extra)

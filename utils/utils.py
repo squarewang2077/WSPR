@@ -325,6 +325,95 @@ def compute_pr_on_clean_correct_old(
     return pr, total_used, clean_acc
 
 
+def compute_pr_on_clean_correct(
+    model, gmm, loader, out_shape, device,
+    num_samples=100, batch_indices=None,
+    temperature=1.0,
+    use_soft_sampling=False,
+    chunk_size=None
+):
+    """
+    Compute PR on clean-correct set using the unified evaluate_pr() method.
+
+    This function has been refactored to use GMM4PR.evaluate_pr() for consistent
+    and correct PR computation. The old parameters (use_pr_loss, enable_grad) have
+    been removed and replaced with use_soft_sampling.
+
+    PR = E_{(x,y) ∈ CleanCorrect} E_{delta~GMM} [ 1{ f(x+delta) = y } ]
+
+    Args:
+        model: Classifier model (should be in eval mode)
+        gmm: GMM4PR instance (already loaded with feat_extractor and up_sampler)
+        loader: DataLoader for evaluation
+        out_shape: Image shape (C, H, W) - currently unused, kept for backward compatibility
+        device: torch device
+        num_samples: Number of samples per image
+        batch_indices: Optional set/list of batch indices to evaluate
+        temperature: Gumbel-Softmax temperature (only used if use_soft_sampling=True)
+        use_soft_sampling: If True, use Gumbel-Softmax (matches training sampling).
+                          If False, use hard categorical sampling (true GMM distribution).
+                          Default is False (recommended for evaluation).
+        chunk_size: Maximum samples to process at once. If None, uses adaptive chunking.
+                   Useful for large num_samples to avoid OOM errors.
+
+    Returns:
+        (pr, n_used, clean_acc): PR score, number of clean-correct samples, clean accuracy
+    """
+
+    total_used = 0       # number of clean-correct samples
+    pr_sum = 0.0         # sum of per-image PR values
+    clean_correct = 0    # number of correctly classified clean samples
+    total_seen = 0       # total samples seen
+
+    with torch.no_grad():
+        for it, (x, y, _) in enumerate(loader):
+            if (batch_indices is not None) and (it not in batch_indices):
+                continue
+
+            x, y = x.to(device), y.to(device)
+            B = x.size(0)
+
+            # Clean predictions & mask of correct ones
+            logits_clean = model(x)
+            pred_clean = logits_clean.argmax(1)
+            mask = (pred_clean == y)
+
+            clean_correct += mask.sum().item()
+            total_seen += B
+
+            if mask.sum().item() == 0:
+                continue  # nothing to evaluate in this batch
+
+            x_sel = x[mask]
+            y_sel = y[mask]
+            n = x_sel.size(0)
+
+            # Use the unified evaluate_pr() method - clean and consistent!
+            per_image_pr = gmm.evaluate_pr(
+                x_sel, y_sel, model,
+                num_samples=num_samples,
+                use_soft_sampling=use_soft_sampling,
+                temperature=temperature,
+                reduction='none',
+                chunk_size=chunk_size
+            )
+
+            # Accumulate per-image PR (CORRECT weighting!)
+            # per_image_pr is shape [n], so sum gives total PR contribution
+            pr_sum += per_image_pr.sum().item()
+            total_used += n
+
+    pr = pr_sum / max(1, total_used)
+    clean_acc = clean_correct / max(1, total_seen)
+
+    method_name = "soft (Gumbel-Softmax)" if use_soft_sampling else "hard (categorical)"
+    chunk_info = f", chunk_size={chunk_size}" if chunk_size is not None else ""
+    print(f"[PR@clean] used={total_used} / seen={total_seen} "
+          f"(clean acc={clean_acc*100:.2f}%), num_samples={num_samples}{chunk_info} → PR={pr:.4f} [method: {method_name}]")
+
+    return pr, total_used, clean_acc
+
+
 ### Additional utility functions for the class of gmm4pr which is a advanced version ###
 def slug_gamma(g):
     """Make gamma filename-safe."""
@@ -366,83 +455,97 @@ def initialize_gmm_parameters(gmm, init_mode='spread'):
 
 class TemperatureScheduler:
     """Temperature scheduler."""
-    def __init__(self, gmm, initial_T_pi=2.0, final_T_pi=1.0, 
-                 initial_T_sigma=1.5, final_T_sigma=1.0,
+    def __init__(self, gmm, initial_T_pi=1.0, final_T_pi=1.0, 
+                 initial_T_mu=1.0, final_T_mu=1.0,
+                 initial_T_sigma=1.0, final_T_sigma=1.0,
                  initial_T_shared=1.0, final_T_shared=1.0,
                  warmup_epochs=50):
         self.gmm = gmm
         self.initial_T_pi = initial_T_pi
         self.final_T_pi = final_T_pi
+
+        self.initial_T_mu = initial_T_mu
+        self.final_T_mu = final_T_mu
+
         self.initial_T_sigma = initial_T_sigma
         self.final_T_sigma = final_T_sigma
+
         self.initial_T_shared = initial_T_shared
         self.final_T_shared = final_T_shared
+
         self.warmup_epochs = warmup_epochs
         
     def step(self, epoch):
         """Update temperatures."""
-        if epoch <= self.warmup_epochs:
+        if epoch < self.warmup_epochs:
             alpha = epoch / self.warmup_epochs
+
             T_pi = self.initial_T_pi + alpha * (self.final_T_pi - self.initial_T_pi)
+            T_mu = self.initial_T_mu + alpha * (self.final_T_mu - self.initial_T_mu)
             T_sigma = self.initial_T_sigma + alpha * (self.final_T_sigma - self.initial_T_sigma)
             T_shared = self.initial_T_shared + alpha * (self.final_T_shared - self.initial_T_shared)
         else:
+
             T_pi = self.final_T_pi
+            T_mu = self.final_T_mu
             T_sigma = self.final_T_sigma
             T_shared = self.final_T_shared
-        
-        self.gmm.set_temperatures(T_pi=T_pi, T_sigma=T_sigma, T_shared=T_shared)
-        return T_pi, T_sigma, T_shared
+
+        self.gmm.set_temperatures(T_pi=T_pi, T_mu=T_mu, T_sigma=T_sigma, T_shared=T_shared)
+        return T_pi, T_mu, T_sigma, T_shared
 
 
 @torch.no_grad()
 def check_mode_collapse(gmm, loader, device, num_batches=10):
-    """Check mode collapse."""
+    """Check mode collapse by sampling from loader."""
     gmm.eval()
-    pi_distributions = []
-    
-    for i, (x, y, _) in enumerate(loader):
-        if i >= num_batches:
-            break
-        x, y = x.to(device), y.to(device)
-        
-        out = gmm.forward(x=x, y=y)
-        pi_logits = out['cache']['pi_logits']
-        pi_probs = F.softmax(pi_logits, dim=-1)
-        pi_distributions.append(pi_probs.cpu())
-    
-    all_pi = torch.cat(pi_distributions, dim=0)
-    mean_pi = all_pi.mean(dim=0)
-    max_pi = mean_pi.max().item()
-    min_pi = mean_pi.min().item()
-    std_pi = mean_pi.std().item()
-    entropy = -(mean_pi * torch.log(mean_pi + 1e-8)).sum().item()
-    max_entropy = np.log(gmm.K)
-    
-    print(f"\n{'='*60}")
-    print(f"MODE COLLAPSE CHECK (K={gmm.K})")
-    print(f"{'='*60}")
-    print(f"Average π per component: {mean_pi.numpy()}")
-    print(f"Max π: {max_pi:.4f} | Min π: {min_pi:.4f} | Std: {std_pi:.4f}")
-    print(f"Entropy: {entropy:.4f} / {max_entropy:.4f} ({entropy/max_entropy*100:.1f}%)")
-    
-    if max_pi > 0.5:
-        print(f"⚠️  WARNING: Potential mode collapse!")
-    elif std_pi > 0.15:
-        print(f"⚠️  WARNING: High variance in usage")
-    else:
-        print(f"✓ Component usage looks balanced")
-    print(f"{'='*60}\n")
-    
-    gmm.train()
-    return {
-        'mean_pi': mean_pi.numpy(),
-        'max_pi': max_pi,
-        'min_pi': min_pi,
-        'std_pi': std_pi,
-        'entropy': entropy,
-        'entropy_ratio': entropy / max_entropy
-    }
+    try:
+        pi_distributions = []
+
+        for i, (x, y, _) in enumerate(loader):
+            if i >= num_batches:
+                break
+            x, y = x.to(device), y.to(device)
+
+            out = gmm.forward(x=x, y=y)
+            pi_logits = out['cache']['pi_logits']
+            pi_probs = F.softmax(pi_logits, dim=-1)
+            pi_distributions.append(pi_probs.cpu())
+
+        all_pi = torch.cat(pi_distributions, dim=0)
+        mean_pi = all_pi.mean(dim=0)
+        max_pi = mean_pi.max().item()
+        min_pi = mean_pi.min().item()
+        std_pi = mean_pi.std().item()
+        entropy = -(mean_pi * torch.log(mean_pi + 1e-8)).sum().item()
+        max_entropy = np.log(gmm.K)
+
+        print(f"\n{'='*60}")
+        print(f"MODE COLLAPSE CHECK (K={gmm.K})")
+        print(f"{'='*60}")
+        print(f"Average π per component: {mean_pi.numpy()}")
+        print(f"Max π: {max_pi:.4f} | Min π: {min_pi:.4f} | Std: {std_pi:.4f}")
+        print(f"Entropy: {entropy:.4f} / {max_entropy:.4f} ({entropy/max_entropy*100:.1f}%)")
+
+        if max_pi > 0.5:
+            print(f"WARNING: Potential mode collapse!")
+        elif std_pi > 0.15:
+            print(f"WARNING: High variance in usage")
+        else:
+            print(f"Component usage looks balanced")
+        print(f"{'='*60}\n")
+
+        return {
+            'mean_pi': mean_pi.numpy(),
+            'max_pi': max_pi,
+            'min_pi': min_pi,
+            'std_pi': std_pi,
+            'entropy': entropy,
+            'entropy_ratio': entropy / max_entropy
+        }
+    finally:
+        # Always restore training mode, even if an exception occurs
+        gmm.train()
 
 
 def build_decoder_from_flag(backend: str, latent_dim: int, out_shape: tuple, device):
@@ -481,8 +584,25 @@ def build_decoder_from_flag(backend: str, latent_dim: int, out_shape: tuple, dev
             num_layers += 1
         return num_layers
     
-    # ============ FROZEN DECODERS ============
+    # ============ DECODERS ============
     if backend == "bicubic":
+        class BicubicDecoder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.init_size = calc_init_size(min(H, W))
+                self.init_dim = C * self.init_size * self.init_size
+            
+            def forward(self, z):
+                B = z.size(0)
+                assert z.size(1) == self.init_dim, f"Expected latent_dim={self.init_dim}, got {z.size(1)}"
+
+                z = z.view(B, C, self.init_size, self.init_size)
+                return F.interpolate(z, size=(H, W), mode='bicubic', align_corners=False)
+
+        decoder = BicubicDecoder().to(device)
+        print(f"[Decoder 'bicubic'] {sum(p.numel() for p in decoder.parameters()):,} params")
+
+    elif backend == "bicubic_trainable":
         class BicubicDecoder(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -497,8 +617,8 @@ def build_decoder_from_flag(backend: str, latent_dim: int, out_shape: tuple, dev
                 return F.interpolate(h, size=(H, W), mode='bicubic', align_corners=False)
         
         decoder = BicubicDecoder().to(device)
-        print(f"[Decoder 'bicubic'] {sum(p.numel() for p in decoder.parameters()):,} params (frozen decoder)")
-    
+        print(f"[Decoder 'bicubic'] {sum(p.numel() for p in decoder.parameters()):,} params")
+
     elif backend == "wavelet":
         try:
             import pywt
@@ -712,7 +832,7 @@ def build_decoder_from_flag(backend: str, latent_dim: int, out_shape: tuple, dev
     else:
         raise ValueError(
             f"Unknown decoder backend: '{backend}'. Choose from:\n"
-            f"  Frozen:    bicubic, wavelet, dct, nearest_blur\n"
+            f"  Frozen: wavelet, dct, nearest_blur\n"
             f"  Trainable: conv, upsample, tiny, mlp"
         )
     

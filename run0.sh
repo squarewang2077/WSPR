@@ -30,4 +30,7 @@ export CUDA_VISIBLE_DEVICES=0
 #     done
 # done
 
-python fit_gmm2.py --dataset cifar10 --arch resnet18 --clf_ckpt ./model_zoo/trained_model/resnet18_cifar10.pth --K 7 --condition xy --use_decoder --decoder_backend bicubic
+python fit_gmm2.py --config resnet18_on_cifar10_linf_K3
+# python fit_gmm2.py --config resnet18_on_cifar10_linf_K7
+# python fit_gmm2.py --config resnet18_on_cifar10_linf_K12
+# python fit_gmm2.py --config x_dependent_test_2
