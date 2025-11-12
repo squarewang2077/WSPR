@@ -64,7 +64,7 @@ def get_dataset(name, root="./dataset", train=False, resize=False):
             tf = T.Compose([T.Resize(224),T.CenterCrop(224),T.ToTensor(),T.Normalize(mean,std)])
             input_shape = (3,224,224)
         else:
-            tf = T.Compose([T.Resize(64),T.CenterCrop(64),T.ToTensor(),T.Normalize(mean,std)])
+            tf = T.Compose([T.ToTensor(),T.Normalize(mean,std)])
             input_shape = (3,64,64)
 
         num_classes = 200

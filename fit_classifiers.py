@@ -17,9 +17,15 @@ Datasets:
   - cifar10, cifar100, tinyimagenet (val folder layout from the official release)
 
 Notes:
-  * With --pretrained (default=True), images are resized to 224×224 and normalized with ImageNet stats,
-    so we can load torchvision's ImageNet weights directly.
+  * By default, --pretrained loads ImageNet weights and uses 224×224 images with ImageNet stats.
+  * You can override image size with --img_size (e.g., --img_size 32 for CIFAR native size)
+    to finetune pretrained models on smaller images.
+  * --use_imnet_stats controls normalization independently (useful for transfer learning).
   * With --pretrained false, we use dataset-native sizes & stats, and train from scratch.
+
+Examples:
+  * Finetune pretrained ResNet18 on CIFAR-100 with native 32×32 images:
+      python fit_classifiers.py --dataset cifar100 --arch resnet18 --pretrained true --img_size 32
 
 Save:
   * The best checkpoint by validation accuracy is saved to:
@@ -75,12 +81,15 @@ def get_norm_stats(dataset: str, use_imnet_stats: bool):
     raise ValueError(f"Unknown dataset {dataset}")
 
 
-def get_default_img_size(arch: str, pretrained: bool, dataset: str) -> int:
+def get_default_img_size(arch: str, pretrained: bool, dataset: str, manual_override: int = None) -> int:
     """
     Decide input size:
-      - if pretrained: 224 (to match ImageNet weights) for all listed models
+      - if manual_override is provided, use that
+      - elif pretrained: 224 (to match ImageNet weights) for all listed models
       - else: native dataset sizes (CIFAR: 32; TinyImageNet: 64)
     """
+    if manual_override is not None:
+        return manual_override
     if pretrained:
         return 224
     if dataset == "tinyimagenet":
@@ -228,9 +237,10 @@ def evaluate(model: nn.Module, loader, device) -> float:
 def train_one_epoch(model, loader, optimizer, scaler, device, criterion, epoch=None, total_epochs=None):
     model.train()
     running_loss = 0.0
+    total_samples = 0
     # Wrap loader with tqdm
     pbar = tqdm(loader, desc=f"Train Epoch [{epoch}/{total_epochs}]" if epoch else "Training", leave=False)
-    
+
     for x, y in pbar:
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
@@ -243,7 +253,8 @@ def train_one_epoch(model, loader, optimizer, scaler, device, criterion, epoch=N
         scaler.update()
 
         running_loss += loss.item() * y.size(0)
-        avg_loss = running_loss / ((pbar.n + 1) * y.size(0))  # average loss
+        total_samples += y.size(0)
+        avg_loss = running_loss / total_samples  # correct average loss calculation
 
         pbar.set_postfix(loss=f"{avg_loss:.4f}")  # loss on the progress bar
 
@@ -265,7 +276,11 @@ def main():
     ap.add_argument("--weight_decay", type=float, default=5e-4)
     ap.add_argument("--label_smoothing", type=float, default=0.0)
     ap.add_argument("--pretrained", type=lambda s: s.lower() in ["1","true","yes","y"], default=True,
-                    help="Use ImageNet-pretrained weights (and 224 x 224 inputs)")
+                    help="Use ImageNet-pretrained weights")
+    ap.add_argument("--img_size", type=int, default=None,
+                    help="Input image size. If None, uses 224 for pretrained or dataset-native size (32/64)")
+    ap.add_argument("--use_imnet_stats", type=lambda s: s.lower() in ["1","true","yes","y"], default=None,
+                    help="Use ImageNet normalization stats. If None, auto-decide based on --pretrained")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", type=str, default="cuda")
     # If --out is empty, we will save to ./model_zoo/trained_model/<arch>_<dataset>.pth
@@ -277,8 +292,12 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     # Decide input size + normalization policy
-    img_size = get_default_img_size(args.arch, args.pretrained, args.dataset)
-    use_imnet_stats = bool(args.pretrained)
+    img_size = get_default_img_size(args.arch, args.pretrained, args.dataset, args.img_size)
+    # If use_imnet_stats not explicitly set, default based on pretrained flag
+    use_imnet_stats = args.use_imnet_stats if args.use_imnet_stats is not None else bool(args.pretrained)
+
+    print(f"[config] dataset={args.dataset}, arch={args.arch}, pretrained={args.pretrained}")
+    print(f"[config] img_size={img_size}, use_imnet_stats={use_imnet_stats}")
 
     # Build datasets/loaders
     train_set, num_classes = get_dataset(args.dataset, args.data_root, True,  img_size, use_imnet_stats)

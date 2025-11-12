@@ -1021,10 +1021,13 @@ class GMM4PR(nn.Module):
             num_cls=cfg["num_cls"],
             hidden_dim=cfg["hidden_dim"]
         )
-        
-        # Set external components if provided
-        if feat_extractor is not None:
-            model.set_feat_extractor(feat_extractor)
+
+        # this is my fault, since some of the loaded model save the feat_extractor inside
+        # but older ones do not have it, shit! especially the unconditional ones
+        if any("feat_extractor" in k for k in ckpt["state_dict"].keys()):
+            # Set external components if provided
+            if feat_extractor is not None:
+                model.set_feat_extractor(feat_extractor)
         if up_sampler is not None:
             model.set_up_sampler(up_sampler)
         
@@ -1035,5 +1038,11 @@ class GMM4PR(nn.Module):
         # Load weights
         model.load_state_dict(ckpt["state_dict"], strict=strict)
         
+        if not any("feat_extractor" in k for k in ckpt["state_dict"].keys()):
+            # Set external components if provided
+            if feat_extractor is not None:
+                model.set_feat_extractor(feat_extractor)
+
+
         print(f"Model loaded from {path}")
         return model

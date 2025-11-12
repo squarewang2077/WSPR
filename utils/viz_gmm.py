@@ -251,7 +251,7 @@ def plot_tensor_heatmaps(
             if isinstance(titles, (list, tuple)) and len(titles) == K:
                 ax.set_title(str(titles[k]), fontsize=10, pad=4)
             else:
-                ax.set_title(f"Matrix {k+1}", fontsize=10, pad=4)
+                ax.set_title(f"Cov. {k+1}", fontsize=10, pad=4)
 
     # 删除空白子图
     for k in range(K, nrows * ncols):

@@ -40,7 +40,7 @@ def main():
     parser = argparse.ArgumentParser(description="GMM4PR Training")
     
     # Config selection
-    parser.add_argument("--config", type=str, default="resnet18_on_cifar10_linf_K3",
+    parser.add_argument("--config", type=str, default="resnet18_on_tinyimagenet",
                        help="Config name from config.py")
     parser.add_argument("--list-configs", action="store_true", default=False, # false for debug
                        help="List all available configs and exit")
@@ -309,13 +309,15 @@ def main():
             
             # Only use correctly classified samples
             with torch.no_grad():
+                model.eval()
                 pred = model(x).argmax(1)
-                mask = (pred == y)
-            
-            if mask.sum() == 0:
-                continue
-            
-            x_clean, y_clean = x[mask], y[mask]
+                mask = (pred == y).tolist()
+                # debug_mask = [False] * 256
+                # debug_mask[0] = True
+                if sum(mask) == 0:
+                    continue                
+            x_clean = x[mask] 
+            y_clean = y[mask]
             total_samples += len(y_clean)
             num_processed_batches += 1
 

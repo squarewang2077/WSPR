@@ -6,3 +6,5 @@ log/*
 model_zoo/*
 tmp/*
 ckp/*
+logs/*
+ar_and_pr/*

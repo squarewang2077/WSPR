@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 
+# # Enable command logging
+# set -x
+
+# # Create log file with timestamp
+# LOGFILE="./logs/run1_$(date +%Y%m%d_%H%M%S).log"
+# exec > >(tee -a "$LOGFILE") 2>&1
+
 export CUDA_VISIBLE_DEVICES=1
+
+# echo "=== Starting run1.sh at $(date) ==="
+# echo "Log file: $LOGFILE"
 
 
 # for num_modes in 20
@@ -30,7 +40,19 @@ export CUDA_VISIBLE_DEVICES=1
 #     done
 # done
 
-python fit_gmm2.py --config resnet18_on_cifar10_l2_K3
+# python fit_gmm2.py --config resnet18_on_cifar10_l2_K3
 # python fit_gmm2.py --config resnet18_on_cifar10_l2_K7
 # python fit_gmm2.py --config resnet18_on_cifar10_l2_K12
 # python fit_gmm2.py --config x_dependent_test_4
+
+# python fit_gmm2.py --config resnet18_on_cifar10_fixed
+
+# python fit_gmm2.py --config resnet18_on_tinyimagenet
+python fit_gmm2.py --config resnet50_on_cifar10
+python fit_gmm2.py --config wrn50_on_cifar10
+python fit_gmm2.py --config vgg16_on_cifar10
+
+# python fit_gmm2.py --config resnet50_on_cifar10
+# python fit_gmm2.py --config wrn50_on_cifar10
+# python fit_gmm2.py --config vgg16_on_cifar10
+

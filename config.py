@@ -4,6 +4,7 @@ Configuration file for GMM4PR experiments.
 All hyperparameters in one place.
 """
 
+from ctypes import resize
 from dataclasses import dataclass
 
 
@@ -40,33 +41,33 @@ class Config(BasicConfig):
 
     ### experiment-specific settings ###
     # GMM settings
-    K: int = 1  # 1, 3, 7, 20
-    latent_dim: int = 64  # For CIFAR10 without compression
+    K: int = 7  # 1, 3, 7, 20
+    latent_dim: int = 128  # For CIFAR10 without compression
 
     # Condition settings
-    cond_mode: str | None = None  # x, y, xy, None
-    cov_type: str = "diag"  # diag, lowrank, full
+    cond_mode: str | None = 'xy'  # x, y, xy, None
+    cov_type: str = "full"  # diag, lowrank, full
     cov_rank: int = 0  # For lowrank only
-    hidden_dim: int = 256
+    hidden_dim: int = 512
 
     # Label Embedding
-    use_y_embedding: bool = False
-    y_emb_dim: int = 0
-    y_emb_normalize: bool = False
+    use_y_embedding: bool = True
+    y_emb_dim: int = 128
+    y_emb_normalize: bool = True
 
     # Decoder
-    use_decoder: bool = False
-    decoder_backend: str = "bicubic"  # bicubic, conv, mlp, etc.
+    use_decoder: bool = True
+    decoder_backend: str = "bicubic_trainable"  # bicubic, conv, mlp, etc.
 
     # Perturbation Budget
     norm: str = 'linf'
-    epsilon: float = 4/255  # 4/255 8/255 16/255
+    epsilon: float = 16/255  # 4/255 8/255 16/255
     ### experiment-specific hyperparameters ###
 
     # Training Hyperparameters
-    epochs: int = 200  
-    batch_size: int = 512  
-    batch_index_max: int = float('inf')  # For debugging, limit number of batches per epoch 
+    epochs: int = 50  
+    batch_size: int = 256  
+    batch_index_max: int = float("inf")  # For debugging, limit number of batches per epoch 
     
     lr: float = 5e-4
     weight_decay: float = 0.0
@@ -84,7 +85,7 @@ class Config(BasicConfig):
 
     # Sampling
     num_samples: int = 32  # MC samples per image
-    chunk_size: int = 64
+    chunk_size: int = 32
     
     # Regularization
     reg_pi_entropy: float = 0.0
@@ -102,7 +103,7 @@ class Config(BasicConfig):
 
     T_shared_init: float = 1.5
     T_shared_final: float = 1.0
-    warmup_epochs: int = 50 # Number of warmup epochs for temperature annealing
+    warmup_epochs: int = 50  # Number of warmup epochs for temperature annealing
     
     # Gumbel-Softmax Temperature (for reparameterized sampling)
     use_gumbel_anneal: bool = True  # Enable temperature annealing
@@ -138,13 +139,126 @@ def get_config(name: str = "debug") -> Config:
     """
     configs = {
 
-        "resnet18_on_cifar10_linf_K3": Config(
+        "resnet18_on_cifar10_linf": Config(
             # Experiment name
-            exp_name = "K3_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            # learning settings for none 
+            lr = 5e-4,
+            use_lr_scheduler = False,
+            # lr_min = 2e-6,  # Minimum learning rate for cosine annealing
+            # lr_warmup_epochs = 5,  # Number of warmup epochs
+            warmup_epochs = 10,  # Number of warmup epochs for temperature annealing
 
             # GMM settings
-            K = 3,  # 3, 7, 12
+            K = 7,  # 3, 7, 12
             latent_dim = 128,  
+
+            # Condition settings
+            cond_mode = "xy",  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 256,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 64,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+        ),
+
+
+### other models on CIFAR10 can be added here ###
+
+        "resnet50_on_cifar10": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "cifar10",  # cifar10, cifar100, tinyimagenet
+            # Model Architecture
+            arch = "resnet50",
+            clf_ckpt = "./model_zoo/trained_model/resnet50_cifar10.pth",
+
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'xy',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 256,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 64,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+        ),
+
+        "wrn50_on_cifar10": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "cifar10",  # cifar10, cifar100, tinyimagenet
+
+            # Model Architecture
+            arch = "wide_resnet50_2",
+            clf_ckpt = "./model_zoo/trained_model/wide_resnet50_2_cifar10.pth",
+
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'xy',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 256,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 64,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+        ),
+
+        "vgg16_on_cifar10": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "cifar10",  # cifar10, cifar100, tinyimagenet
+
+            # Model Architecture
+            arch = "vgg16",
+            clf_ckpt = "./model_zoo/trained_model/vgg16_cifar10.pth",
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
 
             # Condition settings
             cond_mode = 'xy',  # x, y, xy, None
@@ -168,12 +282,18 @@ def get_config(name: str = "debug") -> Config:
         ),
 
 
-        "resnet18_on_cifar10_l2_K3": Config(
+        "vit_on_cifar10": Config(
             # Experiment name
-            exp_name = "K3_cond(xy)_decoder(trainable_128)_l2(1)_reg(none)",
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "cifar10",  # cifar10, cifar100, tinyimagenet
+            resize = True,
+            # Model Architecture
+            arch = "vit_b_16",
+            clf_ckpt = "./model_zoo/trained_model/vit_b_16_cifar10.pth",
 
             # GMM settings
-            K = 3,  # 3, 7, 12
+            K = 7,  # 3, 7, 12
             latent_dim = 128,
 
             # Condition settings
@@ -192,10 +312,364 @@ def get_config(name: str = "debug") -> Config:
             decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
 
             # Perturbation Budget
-            norm = "l2",
-            epsilon = 1.0, # 0.5 1.0 2.0
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
 
         ),
+
+##### CIFAR100 ####
+
+        "resnet18_on_cifar100": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "cifar100",  # cifar10, cifar100, tinyimagenet
+
+            # Model Architecture
+            arch = "resnet18",
+            clf_ckpt = "./model_zoo/trained_model/resnet18_cifar100.pth",
+
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'xy',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 512,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 128,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+        ),
+
+        "resnet50_on_cifar100": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "cifar100",  # cifar10, cifar100, tinyimagenet
+            batch_size = 192,
+            # Model Architecture
+            arch = "resnet50",
+            clf_ckpt = "./model_zoo/trained_model/resnet50_cifar100.pth",
+
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'xy',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 512,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 128,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+        ),
+
+        "wrn50_on_cifar100": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "cifar100",  # cifar10, cifar100, tinyimagenet
+            batch_size = 192,
+            # Model Architecture
+            arch = "wide_resnet50_2",
+            clf_ckpt = "./model_zoo/trained_model/wide_resnet50_2_cifar100.pth",
+
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'xy',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 512,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 128,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+        ),
+
+        "vgg16_on_cifar100": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "cifar100",  # cifar10, cifar100, tinyimagenet
+            batch_size = 192,
+            # Model Architecture
+            arch = "vgg16",
+            clf_ckpt = "./model_zoo/trained_model/vgg16_cifar100.pth",
+
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'xy',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 512,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 128,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+        ),
+
+        "vit_on_cifar100": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "cifar100",  # cifar10, cifar100, tinyimagenet
+            resize = True,
+            # Model Architecture
+            arch = "vit_b_16",
+            clf_ckpt = "./model_zoo/trained_model/vit_b_16_cifar100.pth",
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'xy',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 512,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 128,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+        ),
+
+
+##### TinyImageNet ####
+
+        "resnet18_on_tinyimagenet": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "tinyimagenet",  # cifar10, cifar100, tinyimagenet
+
+            # Model Architecture
+            arch = "resnet18",
+            clf_ckpt = "./model_zoo/trained_model/resnet18_tinyimagenet.pth",
+
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'xy',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 512,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 128,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+        ),
+
+        "resnet50_on_tinyimagenet": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "tinyimagenet",  # cifar10, cifar100, tinyimagenet
+
+            # Model Architecture
+            arch = "resnet50",
+            clf_ckpt = "./model_zoo/trained_model/resnet50_tinyimagenet.pth",
+
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'xy',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 512,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 128,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+        ),
+
+        "wrn50_on_tinyimagenet": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "tinyimagenet",  # cifar10, cifar100, tinyimagenet
+
+            # Model Architecture
+            arch = "wide_resnet50_2",
+            clf_ckpt = "./model_zoo/trained_model/wide_resnet50_2_tinyimagenet.pth",
+
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'xy',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 512,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 128,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+        ),
+
+        "vgg16_on_tinyimagenet": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "tinyimagenet",  # cifar10, cifar100, tinyimagenet
+
+            # Model Architecture
+            arch = "vgg16",
+            clf_ckpt = "./model_zoo/trained_model/vgg16_tinyimagenet.pth",
+
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'xy',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 512,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 128,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+        ),
+
+        "vit_on_tinyimagenet": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "tinyimagenet",  # cifar10, cifar100, tinyimagenet
+            resize = True,
+            # Model Architecture
+            arch = "vit_b_16",
+            clf_ckpt = "./model_zoo/trained_model/vit_b_16_tinyimagenet.pth",
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'xy',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 512,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 128,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+        ),
+
 
     }
     
