@@ -66,7 +66,7 @@ class Config(BasicConfig):
 
     # Training Hyperparameters
     epochs: int = 50  
-    batch_size: int = 256  
+    batch_size: int = 16  
     batch_index_max: int = float("inf")  # For debugging, limit number of batches per epoch 
     
     lr: float = 5e-4
@@ -287,7 +287,7 @@ def get_config(name: str = "debug") -> Config:
             exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
 
             dataset = "cifar10",  # cifar10, cifar100, tinyimagenet
-            resize = True,
+            resize = False,
             # Model Architecture
             arch = "vit_b_16",
             clf_ckpt = "./model_zoo/trained_model/vit_b_16_cifar10.pth",
@@ -496,7 +496,114 @@ def get_config(name: str = "debug") -> Config:
 
 ##### TinyImageNet ####
 
-        "resnet18_on_tinyimagenet": Config(
+        "resnet18_on_tinyimagenet_cond_none": Config(
+            # Experiment name
+            exp_name = "K7_cond(none)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "tinyimagenet",  # cifar10, cifar100, tinyimagenet
+
+            # Model Architecture
+            arch = "resnet18",
+            clf_ckpt = "./model_zoo/trained_model/resnet18_tinyimagenet.pth",
+
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = None,  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 512,
+
+            # Label Embedding
+            use_y_embedding = False,
+            y_emb_dim = 0,
+            y_emb_normalize = False,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+        ),
+
+
+        "resnet18_on_tinyimagenet_cond_y": Config(
+            # Experiment name
+            exp_name = "K7_cond(y)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "tinyimagenet",  # cifar10, cifar100, tinyimagenet
+
+            # Model Architecture
+            arch = "resnet18",
+            clf_ckpt = "./model_zoo/trained_model/resnet18_tinyimagenet.pth",
+
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'y',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 512,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 128,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+        ),
+
+
+        "resnet18_on_tinyimagenet_cond_x": Config(
+            # Experiment name
+            exp_name = "K7_cond(x)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "tinyimagenet",  # cifar10, cifar100, tinyimagenet
+
+            # Model Architecture
+            arch = "resnet18",
+            clf_ckpt = "./model_zoo/trained_model/resnet18_tinyimagenet.pth",
+
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'x',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 512,
+
+            # Label Embedding
+            use_y_embedding = False,
+            y_emb_dim = 0,
+            y_emb_normalize = False,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+        ),
+
+        "resnet18_on_tinyimagenet_cond_xy": Config(
             # Experiment name
             exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
 

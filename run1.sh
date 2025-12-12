@@ -48,11 +48,14 @@ export CUDA_VISIBLE_DEVICES=1
 # python fit_gmm2.py --config resnet18_on_cifar10_fixed
 
 # python fit_gmm2.py --config resnet18_on_tinyimagenet
-python fit_gmm2.py --config resnet50_on_cifar10
-python fit_gmm2.py --config wrn50_on_cifar10
-python fit_gmm2.py --config vgg16_on_cifar10
+# python fit_gmm2.py --config resnet50_on_cifar10
+# python fit_gmm2.py --config wrn50_on_cifar10
+# python fit_gmm2.py --config vgg16_on_cifar10
 
 # python fit_gmm2.py --config resnet50_on_cifar10
 # python fit_gmm2.py --config wrn50_on_cifar10
 # python fit_gmm2.py --config vgg16_on_cifar10
+
+# python fit_gmm2.py --config resnet18_on_tinyimagenet_cond_y
+python fit_gmm2.py --config vit_on_tinyimagenet
 

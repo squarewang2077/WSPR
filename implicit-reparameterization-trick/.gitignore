@@ -1,5 +1,0 @@
-installtorchviz
-code/MNIST
-*/__pycache__
-*/*/__pycache__
-*/*.pth

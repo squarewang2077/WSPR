@@ -1,10 +1,6 @@
 import os
 import torch
 import torchvision
-import pandas as pd
-
-import torch.nn as nn
-import torch.optim as optim
 import torchvision.transforms as transforms
 
 from attacks import nattack, WithIndex

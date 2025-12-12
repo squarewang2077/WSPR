@@ -40,7 +40,7 @@ def main():
     parser = argparse.ArgumentParser(description="GMM4PR Training")
     
     # Config selection
-    parser.add_argument("--config", type=str, default="resnet18_on_tinyimagenet",
+    parser.add_argument("--config", type=str, default="vit_on_cifar10",
                        help="Config name from config.py")
     parser.add_argument("--list-configs", action="store_true", default=False, # false for debug
                        help="List all available configs and exit")
