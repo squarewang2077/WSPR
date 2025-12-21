@@ -21,7 +21,7 @@ class BasicConfig:
     
     # Monitoring & Logging
     check_collapse_every: int = 10  # Check mode collapse every N epochs
-    ckp_dir: str = "./ckp/gmm_ckp"
+    ckp_dir: str = "./ckp/gmm_fitting"
     
 
 @dataclass
@@ -66,7 +66,7 @@ class Config(BasicConfig):
 
     # Training Hyperparameters
     epochs: int = 50  
-    batch_size: int = 16  
+    batch_size: int = 128  
     batch_index_max: int = float("inf")  # For debugging, limit number of batches per epoch 
     
     lr: float = 5e-4
@@ -317,6 +317,119 @@ def get_config(name: str = "debug") -> Config:
 
         ),
 
+        "densenet121_on_cifar10": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "cifar10",  # cifar10, cifar100, tinyimagenet
+            # Model Architecture
+            arch = "densenet121",
+            clf_ckpt = "./ckp/standard_training/densenet/densenet121_cifar10.pth",
+
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'xy',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 256,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 64,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+            # saving directory
+            ckp_dir = "./ckp/gmm_fitting/densenet"
+
+        ),
+
+
+        "mobilenet_on_cifar10": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "cifar10",  # cifar10, cifar100, tinyimagenet
+            # Model Architecture
+            arch = "mobilenet_v3_large",
+            clf_ckpt = "./ckp/standard_training/mobilenet/mobilenet_v3_large_cifar10.pth",
+
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'xy',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 256,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 64,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+            # saving directory
+            ckp_dir = "./ckp/gmm_fitting/mobilenet"
+
+        ),
+
+        "efficientnet_on_cifar10": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "cifar10",  # cifar10, cifar100, tinyimagenet
+            # Model Architecture
+            arch = "efficientnet_b0",
+            clf_ckpt = "./ckp/standard_training/efficientnet/efficientnet_b0_cifar10.pth",
+
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'xy',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 256,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 64,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+            # saving directory
+            ckp_dir = "./ckp/gmm_fitting/efficientnet"
+
+        ),
+
+
 ##### CIFAR100 ####
 
         "resnet18_on_cifar100": Config(
@@ -490,6 +603,116 @@ def get_config(name: str = "debug") -> Config:
             # Perturbation Budget
             norm = "linf",
             epsilon = 16/255, # 4/255 8/255 16/255
+
+        ),
+
+        "densenet121_on_cifar100": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "cifar100",  # cifar10, cifar100, tinyimagenet
+            # Model Architecture
+            arch = "densenet121",
+            clf_ckpt = "./ckp/standard_training/densenet/densenet121_cifar100.pth",
+
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'xy',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 256,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 64,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+            # saving directory
+            ckp_dir = "./ckp/gmm_fitting/densenet"
+
+        ),
+
+        "mobilenet_on_cifar100": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "cifar100",  # cifar10, cifar100, tinyimagenet
+            # Model Architecture
+            arch = "mobilenet_v3_large",
+            clf_ckpt = "./ckp/standard_training/mobilenet/mobilenet_v3_large_cifar100.pth",
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'xy',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 256,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 64,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+            # saving directory
+            ckp_dir = "./ckp/gmm_fitting/mobilenet"
+
+        ),
+
+        "efficientnet_on_cifar100": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "cifar100",  # cifar10, cifar100, tinyimagenet
+            # Model Architecture
+            arch = "efficientnet_b0",
+            clf_ckpt = "./ckp/standard_training/efficientnet/efficientnet_b0_cifar100.pth",
+
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'xy',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 256,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 64,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+            # saving directory
+            ckp_dir = "./ckp/gmm_fitting/efficientnet"
 
         ),
 
@@ -774,6 +997,121 @@ def get_config(name: str = "debug") -> Config:
             # Perturbation Budget
             norm = "linf",
             epsilon = 16/255, # 4/255 8/255 16/255
+
+        ),
+
+        "densenet121_on_tinyimagenet": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "tinyimagenet",  # cifar10, cifar100, tinyimagenet
+            # Model Architecture
+            arch = "densenet121",
+            clf_ckpt = "./ckp/standard_training/densenet/densenet121_tinyimagenet.pth",
+            batch_size = 32,  
+
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'xy',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 256,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 64,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+            # saving directory
+            ckp_dir = "./ckp/gmm_fitting/densenet"
+
+        ),
+
+        "mobilenet_on_tinyimagenet": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "tinyimagenet",  # cifar10, cifar100, tinyimagenet
+            # Model Architecture
+            arch = "mobilenet_v3_large",
+            clf_ckpt = "./ckp/standard_training/mobilenet/mobilenet_v3_large_tinyimagenet.pth",
+            batch_size = 32,  
+
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'xy',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 256,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 64,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+            # saving directory
+            ckp_dir = "./ckp/gmm_fitting/mobilenet"
+
+        ),
+
+        "efficientnet_on_tinyimagenet": Config(
+            # Experiment name
+            exp_name = "K7_cond(xy)_decoder(trainable_128)_linf(16)_reg(none)",
+
+            dataset = "tinyimagenet",  # cifar10, cifar100, tinyimagenet
+            batch_size = 32,  
+
+            # Model Architecture
+            arch = "efficientnet_b0",
+            clf_ckpt = "./ckp/standard_training/efficientnet/efficientnet_b0_tinyimagenet.pth",
+
+            # GMM settings
+            K = 7,  # 3, 7, 12
+            latent_dim = 128,
+
+            # Condition settings
+            cond_mode = 'xy',  # x, y, xy, None
+            cov_type = "full",  # diag, lowrank, full
+            cov_rank = 0,  # For lowrank only
+            hidden_dim = 256,
+
+            # Label Embedding
+            use_y_embedding = True,
+            y_emb_dim = 64,
+            y_emb_normalize = True,
+
+            # Decoder
+            use_decoder = True,
+            decoder_backend = 'bicubic_trainable',  # bicubic, conv, mlp, etc.
+
+            # Perturbation Budget
+            norm = "linf",
+            epsilon = 16/255, # 4/255 8/255 16/255
+
+            # saving directory
+            ckp_dir = "./ckp/gmm_fitting/efficientnet"
 
         ),
 

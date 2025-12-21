@@ -56,6 +56,5 @@ export CUDA_VISIBLE_DEVICES=0
 # python fit_gmm2.py --config vit_on_cifar100
 # python fit_gmm2.py --config vit_on_tinyimagenet
 
-python fit_gmm2.py --config vit_on_cifar100
-# python fit_gmm2.py --config resnet18_on_tinyimagenet_cond_xy
-
+python fit_gmm.py --config efficientnet_on_cifar10
+python fit_gmm.py --config efficientnet_on_cifar100

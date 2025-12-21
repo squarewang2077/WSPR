@@ -9,30 +9,6 @@ import torchvision.utils as vutils
 
 
 
-class WithIndex(torch.utils.data.Dataset):
-    """
-    Wrap an existing dataset so __getitem__ returns (..., idx).
-    Works whether the base dataset returns (img, label) or a dict.
-    """
-    def __init__(self, base_ds):
-        self.base_ds = base_ds
-
-    def __len__(self):
-        return len(self.base_ds)
-
-    def __getitem__(self, idx: int):
-        item = self.base_ds[idx]
-        if isinstance(item, dict):
-            item = dict(item)
-            item["idx"] = idx
-            return item
-        elif isinstance(item, (list, tuple)):
-            return (*item, idx)
-        else:
-            # If dataset returns only img, we attach idx and a dummy label? Better to ensure (img,label)
-            # Here we just return (item, None, idx) for completeness.
-            return (item, None, idx)
-
 @torch.no_grad()
 def n_attack_perbatch(model = None, imgs = None, labels = None, N = 300, sigma = 0.1, \
              att_type = 'infty', epsi = 0.031, \

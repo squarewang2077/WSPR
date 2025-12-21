@@ -4,12 +4,35 @@ import torch
 import torch.nn as nn
 import torchvision
 import torchvision.transforms as T
-from attacks import WithIndex
 import torch.nn.functional as F
 from fit_classifiers import build_model as build_clf_model
 
 
 ### -------------------- Dataset -------------------- ###
+class WithIndex(torch.utils.data.Dataset):
+    """
+    Wrap an existing dataset so __getitem__ returns (..., idx).
+    Works whether the base dataset returns (img, label) or a dict.
+    """
+    def __init__(self, base_ds):
+        self.base_ds = base_ds
+
+    def __len__(self):
+        return len(self.base_ds)
+
+    def __getitem__(self, idx: int):
+        item = self.base_ds[idx]
+        if isinstance(item, dict):
+            item = dict(item)
+            item["idx"] = idx
+            return item
+        elif isinstance(item, (list, tuple)):
+            return (*item, idx)
+        else:
+            # If dataset returns only img, we attach idx and a dummy label? Better to ensure (img,label)
+            # Here we just return (item, None, idx) for completeness.
+            return (item, None, idx)
+
 def get_dataset(name, root="./dataset", train=False, resize=False):
     """
     Get a dataset by name.
@@ -216,114 +239,6 @@ def g_ball(u, gamma, norm_type):
 
     return g
     
-
-def plot_convergence(loss_hist, save_dir="viz", max_batches=5):
-    """
-    Plot loss vs epoch for the first few batches.
-    """
-
-    os.makedirs(save_dir, exist_ok=True)
-    import matplotlib.pyplot as plt
-    plt.figure(figsize=(6,4))
-    for it in sorted(loss_hist.keys())[:max_batches]:
-        y = loss_hist[it]
-        x = list(range(1, len(y)+1))
-        plt.plot(x, y, marker='o', label=f"batch {it}")
-    plt.xlabel("epoch")
-    plt.ylabel("loss")
-    plt.title("Per-batch convergence")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "convergence_per_batch.png"))
-    plt.close()
-    print(f"[viz] saved: {os.path.join(save_dir, 'convergence_per_batch.png')}")
-
-
-
-@torch.no_grad()
-def compute_pr_on_clean_correct_old(
-    model, head, encoder, loader, args, out_shape,
-    decoder=None, S=100, batch_indices=None
-):
-    """
-    PR on clean-correct set:
-      PR = E_{(x,y) ∈ CleanCorrect} E_{eps~GMM_phi(.|x)} [ 1{ f(x+g_B(eps)) = y } ]
-
-    Returns (pr, n_used, clean_acc).
-    """
-    device = next(head.parameters()).device
-    C, H, W = out_shape
-
-    total_used = 0          # number of clean-correct samples included
-    pr_sum = 0.0            # sum of per-sample success probabilities
-    clean_correct = 0
-    total_seen = 0
-
-    for it, (x, y, _) in enumerate(loader):
-        if (batch_indices is not None) and (it not in batch_indices):
-            continue
-        x, y = x.to(device), y.to(device)
-        B = x.size(0)
-
-        # clean preds & mask of correct ones
-        logits_clean = model(x)
-        pred_clean = logits_clean.argmax(1)
-        mask = (pred_clean == y)
-
-        clean_correct += mask.sum().item()
-        total_seen += B
-
-        if mask.sum().item() == 0:
-            continue  # nothing to evaluate in this batch
-
-        x_sel = x[mask]
-        y_sel = y[mask]
-        n = x_sel.size(0)
-
-        # x-dependent parameters
-        if args.xdep:
-            feat = encoder(x_sel)
-        else:
-            # any feat vector works when xdep=False; just match the expected width
-            feat = torch.empty(n, 0, device=device)
-
-        # only batch size matters when xdep=False
-        pi, mu, cov = head(feat)  # shapes (n,K,*)
-        gmm = head.mixture(pi, mu, cov, cov_type=args.cov_type)
-
-        # sample S per selected item → [S, n, D]
-        z = gmm.sample((S,))
-
-        # latent -> image noise
-        if args.use_decoder:
-            u = decoder(z.view(S * n, -1))
-        else:
-            assert z.size(-1) == C * H * W, \
-                f"When --use_decoder=False, latent dim must be C*H*W ({C*H*W})."
-            u = z.view(S * n, C, H, W)
-
-        eps = g_ball(u, gamma=args.gamma, norm_type=args.norm)
-
-        x_rep = x_sel.unsqueeze(0).expand(S, -1, -1, -1, -1).reshape(S * n, C, H, W)
-        y_rep = y_sel.repeat(S)
-
-        logits = model(x_rep + eps)
-        pred = logits.argmax(1)
-
-        # per-sample success prob over S draws
-        succ = (pred == y_rep).float().view(S, n).mean(0)  # (n,)
-
-        pr_sum += succ.sum().item()
-        total_used += n
-
-    pr = pr_sum / max(1, total_used)
-    clean_acc = clean_correct / max(1, total_seen)
-
-    print(f"[PR@clean] used={total_used} / seen={total_seen} "
-          f"(clean acc={clean_acc*100:.2f}%), S={S} → PR={pr:.4f}")
-
-    return pr, total_used, clean_acc
-
 
 def compute_pr_on_clean_correct(
     model, gmm, loader, out_shape, device,
@@ -692,47 +607,6 @@ def build_decoder_from_flag(backend: str, latent_dim: int, out_shape: tuple, dev
         
         decoder = NearestBlurDecoder().to(device)
         print(f"[Decoder 'nearest_blur'] {sum(p.numel() for p in decoder.parameters()):,} params (frozen decoder)")
-    
-    # ============ TRAINABLE DECODERS ============
-    elif backend in ["conv", "convtranspose"]:
-        class ConvDecoder(nn.Module):
-            def __init__(self):
-                super().__init__()
-                # Adaptive architecture based on target size
-                target_size = max(H, W)
-                self.init_size = calc_init_size(target_size)
-                num_layers = calc_num_upsample_layers(self.init_size, target_size)
-                
-                # Initial projection
-                self.fc = nn.Linear(latent_dim, 256 * self.init_size * self.init_size)
-                
-                # Build upsampling layers dynamically
-                layers = []
-                in_ch = 256
-                for i in range(num_layers):
-                    out_ch = max(16, in_ch // 2)  # Halve channels, min 16
-                    layers.extend([
-                        nn.ConvTranspose2d(in_ch, out_ch, 4, 2, 1),
-                        nn.BatchNorm2d(out_ch),
-                        nn.ReLU(True),
-                    ])
-                    in_ch = out_ch
-                
-                # Final layer to match output channels
-                layers.append(nn.Conv2d(in_ch, C, 3, 1, 1))
-                self.decoder = nn.Sequential(*layers)
-            
-            def forward(self, z):
-                B = z.size(0)
-                h = self.fc(z).view(B, 256, self.init_size, self.init_size)
-                out = self.decoder(h)
-                # Adjust to exact target size if needed
-                if out.shape[2:] != (H, W):
-                    out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
-                return out
-        
-        decoder = ConvDecoder().to(device)
-        print(f"[Decoder 'conv'] {sum(p.numel() for p in decoder.parameters()):,} params (trainable)")
     
     elif backend == "upsample":
         class UpsampleDecoder(nn.Module):

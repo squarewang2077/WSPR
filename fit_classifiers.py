@@ -1,44 +1,8 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Unified trainer for CIFAR-10 / CIFAR-100 / TinyImageNet with multiple backbones.
-Supports ImageNet-pretrained weights to accelerate training.
-
-Architectures:
-  - resnet18, resnet50, wide_resnet50_2
-  - vgg16
-  - densenet121
-  - mobilenet_v3_large
-  - efficientnet_b0
-  - vit_b_16
-
-Datasets:
-  - cifar10, cifar100, tinyimagenet (val folder layout from the official release)
-
-Notes:
-  * By default, --pretrained loads ImageNet weights and uses 224×224 images with ImageNet stats.
-  * You can override image size with --img_size (e.g., --img_size 32 for CIFAR native size)
-    to finetune pretrained models on smaller images.
-  * --use_imnet_stats controls normalization independently (useful for transfer learning).
-  * With --pretrained false, we use dataset-native sizes & stats, and train from scratch.
-
-Examples:
-  * Finetune pretrained ResNet18 on CIFAR-100 with native 32×32 images:
-      python fit_classifiers.py --dataset cifar100 --arch resnet18 --pretrained true --img_size 32
-
-Save:
-  * The best checkpoint by validation accuracy is saved to:
-        ./model_zoo/trained_model/<arch>_<dataset>.pth
-    unless you pass a custom --out.
-"""
-
 import os
 import argparse
 import time
 import random
 import numpy as np
-from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -79,7 +43,6 @@ def get_norm_stats(dataset: str, use_imnet_stats: bool):
     if dataset == "tinyimagenet":
         return TINY_MEAN, TINY_STD
     raise ValueError(f"Unknown dataset {dataset}")
-
 
 def get_default_img_size(arch: str, pretrained: bool, dataset: str, manual_override: int = None) -> int:
     """
@@ -269,7 +232,7 @@ def main():
         "resnet18","resnet50","wide_resnet50_2",
         "vgg16","densenet121","mobilenet_v3_large","efficientnet_b0",
         "vit_b_16"
-    ], default="resnet18")
+    ], default="densenet121")
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--batch_size", type=int, default=128)
     ap.add_argument("--lr", type=float, default=0.01)

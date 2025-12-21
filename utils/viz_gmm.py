@@ -11,6 +11,30 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
+
+def plot_convergence(loss_hist, save_dir="viz", max_batches=5):
+    """
+    Plot loss vs epoch for the first few batches.
+    """
+
+    os.makedirs(save_dir, exist_ok=True)
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(6,4))
+    for it in sorted(loss_hist.keys())[:max_batches]:
+        y = loss_hist[it]
+        x = list(range(1, len(y)+1))
+        plt.plot(x, y, marker='o', label=f"batch {it}")
+    plt.xlabel("epoch")
+    plt.ylabel("loss")
+    plt.title("Per-batch convergence")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "convergence_per_batch.png"))
+    plt.close()
+    print(f"[viz] saved: {os.path.join(save_dir, 'convergence_per_batch.png')}")
+
+
+
 def plot_tensor_bars(
     t: torch.Tensor,
     *,
@@ -109,7 +133,6 @@ def plot_tensor_bars(
 
 
 def _style_axes(ax):
-    """极简黑白风格，适合论文。"""
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
     for spine in ("left", "bottom"):
@@ -274,234 +297,3 @@ def _style_axes_heat(ax):
         ax.spines[spine].set_linewidth(0.8)
         ax.spines[spine].set_color("0.0")
     ax.tick_params(axis="both", which="both", length=3, width=0.8, color="0.0", labelsize=8)
-
-
-
-# def _to_numpy(x: torch.Tensor):
-#     return x.detach().cpu().numpy()
-
-
-# def _to_correlation(Sigma: torch.Tensor) -> torch.Tensor:
-#     eps = 1e-8
-#     var = Sigma.diagonal(dim1=-2, dim2=-1).clamp_min(eps)  # (K,D)
-#     std = var.sqrt()
-#     denom = std.unsqueeze(-1) * std.unsqueeze(-2)          # (K,D,D)
-#     Corr = Sigma / denom
-#     return Corr.clamp_(-1.0, 1.0)
-
-
-# @torch.no_grad()
-# def _kde2d(points_2d: torch.Tensor,
-#            xmin: float, xmax: float, ymin: float, ymax: float,
-#            gridsize: int = 200, bandwidth: float = None):
-#     device = points_2d.device
-#     N = points_2d.size(0)
-#     if N == 0:
-#         raise ValueError("kde2d: empty input.")
-#     if bandwidth is None:
-#         std = points_2d.std(dim=0).clamp(min=1e-6)
-#         h = 1.06 * std.mean() * (float(N) ** (-1.0/5.0))
-#     else:
-#         h = torch.tensor(float(bandwidth), device=device)
-
-#     xs = torch.linspace(xmin, xmax, gridsize, device=device)
-#     ys = torch.linspace(ymin, ymax, gridsize, device=device)
-#     X, Y = torch.meshgrid(xs, ys, indexing="xy")
-#     Px = points_2d[:, 0].view(-1, 1, 1)
-#     Py = points_2d[:, 1].view(-1, 1, 1)
-#     Z = torch.exp(-((X.unsqueeze(0)-Px)**2 + (Y.unsqueeze(0)-Py)**2)/(2*h*h)).mean(0)
-#     Z = Z / Z.max().clamp_min(1e-12)
-#     return X.cpu().numpy(), Y.cpu().numpy(), Z.cpu().numpy()
-
-# def _contour_plot(ax, pts2d: torch.Tensor, title: str, gridsize=200, pad=0.1):
-#     if pts2d.numel() == 0:
-#         ax.set_title(title + " (no data)"); ax.axis("off"); return
-#     x = pts2d[:,0]; y=pts2d[:,1]
-#     xmin, xmax = float(x.min()), float(x.max())
-#     ymin, ymax = float(y.min()), float(y.max())
-#     rx, ry = xmax-xmin, ymax-ymin
-#     if rx <= 0: rx = 1.0
-#     if ry <= 0: ry = 1.0
-#     xmin -= pad*rx; xmax += pad*rx
-#     ymin -= pad*ry; ymax += pad*ry
-#     X, Y, Z = _kde2d(pts2d, xmin, xmax, ymin, ymax, gridsize=gridsize)
-#     ax.contourf(X, Y, Z, levels=12, alpha=0.85)
-#     ax.contour(X, Y, Z, levels=12, linewidths=0.8)
-#     ax.set_title(title); ax.set_xticks([]); ax.set_yticks([])
-
-# def _latent_to_eps(z: torch.Tensor, use_decoder: bool, decoder,
-#                    C: int, H: int, W: int,
-#                    gamma: float, norm_type: str,
-#                    g_ball_fn):
-#     N, D = z.shape
-#     if use_decoder:
-#         u = decoder(z)
-#         if u.dim() == 2:
-#             u = u.view(N, C, H, W)
-#     else:
-#         u = z.view(N, C, H, W)
-#     eps = g_ball_fn(u, gamma=gamma, norm_type=norm_type)
-#     return eps.view(N, -1)
-
-
-# @torch.no_grad()
-# def visualize_gmm_components_notebook(
-#     head,
-#     *,
-#     encoder=None,                 # xdep=True need encoder
-#     x_for_xdep: torch.Tensor=None,
-#     # take from your model if use_decoder=True
-#     out_shape=None,               # (C,H,W)，needed when use_decoder=True
-#     g_ball_fn=None,
-#     use_decoder: bool=False,
-#     gamma: float=8/255,
-#     norm_type: str="linf",
-#     # plot settings
-#     as_correlation: bool=True,
-#     max_cov_dim: int=32,
-#     S_latent: int=4000,           # for every contour sampling number
-#     gridsize: int=200,
-#     figure_dpi: int=160,
-#     save_dir: str=None            # if not None，save in the directory
-# ):
-#     """
-#     Generate an individual image for each Gaussian component k (and display in the notebook):
-#       (1) π_k small bar plot
-#       (2) μ_k 1xd heatmap in the shared d-dimensional subspace
-#       (3) Σ_k or correlation matrix dxd heatmap in that subspace
-#       (4) Latent 2D contour (using the first two dimensions of the global projection basis)
-#       (5) 2D contour after g_B (perform PCA->2D on ε samples)
-#     """
-#     device = next(head.parameters()).device if hasattr(head, "parameters") else torch.device("cpu")
-
-#     # take (pi, mu, cov) from head
-#     if getattr(head, "xdep", False):
-#         if encoder is None or x_for_xdep is None:
-#             raise RuntimeError("x-dependent GMM 需要 encoder 和 x_for_xdep。")
-#         x = x_for_xdep
-#         if x.dim() == 3: x = x.unsqueeze(0)
-#         feat = encoder(x.to(device))
-#     else:
-#         feat = torch.empty(1, 0, device=device)
-
-#     pi_b, mu_b, cov_b = head(feat) # pi:(1,K), mu:(1,K,D)
-#     pi = pi_b[0]; mu = mu_b[0]  # (K,), (K,D)
-
-#     # ---- setup of full Sigma ----
-#     if head.cov_type == "diag":
-#         Sigma = _cov_to_full(cov_b[0], "diag") # (K,D,D)
-#     elif head.cov_type == "full":
-#         Sigma = _cov_to_full(cov_b[0], "full")
-#     else:
-#         U, sigma = cov_b
-#         Sigma = _cov_to_full((U[0], sigma[0]), "lowrank")
-
-#     K, D = mu.shape
-
-#     # ---- shared projection base：P_d (D->d), P_2d (D->2) ----
-#     P_d, P_2d = pick_projection(Sigma, pi, max_dim=max_cov_dim)
-#     d = P_d.shape[1]
-
-#     # ---- setup of color range ----
-#     mu_proj_all = mu @ P_d # (K,d)
-#     mu_abs = float(mu_proj_all.abs().max().item())
-#     mu_vmax = max(1e-6, mu_abs); mu_vmin = -mu_vmax
-
-#     # cov/corr matrix in the projected d-dim space
-#     Sigma_proj = torch.stack([P_d.t() @ Sigma[k] @ P_d for k in range(K)], dim=0)  # (K,d,d)
-#     if as_correlation:
-#         Mat_stack = _to_correlation(Sigma_proj)
-#         cov_cmap, cov_vmin, cov_vmax, cov_label = "coolwarm", -1.0, 1.0, "Correlation"
-#     else:
-#         Mat_stack = Sigma_proj
-#         ma = float(Mat_stack.abs().max().item())
-#         cov_vmax = max(1e-6, ma); cov_vmin = -cov_vmax
-#         cov_cmap, cov_label = "coolwarm", "Covariance"
-
-#     # ---- for saving ----
-#     if save_dir is not None:
-#         os.makedirs(save_dir, exist_ok=True)
-
-#     C = H = W = None
-#     if use_decoder:
-#         if out_shape is None:
-#             raise ValueError("use_decoder=True 时必须提供 out_shape=(C,H,W).")
-#         C, H, W = out_shape
-#         if g_ball_fn is None:
-#             raise ValueError("use_decoder=True 时必须提供 g_ball_fn.")
-
-#     for k in range(K):
-#         fig = plt.figure(figsize=(12, 6.5), dpi=figure_dpi)
-#         gs = fig.add_gridspec(nrows=2, ncols=4, height_ratios=[1,1.3])
-
-#         # (1) π_k
-#         ax_pi = fig.add_subplot(gs[0, 0])
-#         ax_pi.bar([0], [float(pi[k])], width=0.6)
-#         ax_pi.set_title(f"π[{k}] = {float(pi[k]):.4f}")
-#         ax_pi.set_xticks([]); ax_pi.set_ylabel("Weight")
-#         ax_pi.set_ylim(0, float(pi.max())*1.05 + 1e-6)
-
-#         # (2) μ_k heatmap（1×d）
-#         ax_mu = fig.add_subplot(gs[0, 1:4])
-#         mu_k_proj = (mu[k] @ P_d).unsqueeze(0)           # (1,d)
-#         im_mu = ax_mu.imshow(_to_numpy(mu_k_proj), aspect="auto",
-#                              cmap="coolwarm", vmin=mu_vmin, vmax=mu_vmax)
-#         ax_mu.set_title("Projected mean (1×d)")
-#         ax_mu.set_yticks([]); ax_mu.set_xlabel(f"Projected dim (d={d})")
-#         cbar_mu = fig.colorbar(im_mu, ax=ax_mu, fraction=0.025, pad=0.02)
-#         cbar_mu.ax.set_ylabel("Mean value", rotation=90)
-
-#         # (3) Σ_k / Corr_k heatmap（d×d）
-#         ax_cov = fig.add_subplot(gs[1, 0])
-#         im_cov = ax_cov.imshow(_to_numpy(Mat_stack[k]), cmap=cov_cmap, vmin=cov_vmin, vmax=cov_vmax)
-#         ax_cov.set_title(f"{cov_label} (d×d)")
-#         ax_cov.set_xticks([]); ax_cov.set_yticks([])
-#         cbar_cov = fig.colorbar(im_cov, ax=ax_cov, fraction=0.046, pad=0.02)
-
-#         # (4) latent 2D use P_2d
-#         ax_lat = fig.add_subplot(gs[1, 1])
-#         # 用该分量的 full cov 构造一个 2D 采样：先在 D 维采样，再投到 2D
-#         jitter = 1e-6
-#         cov_full = Sigma[k] + jitter * torch.eye(D, device=device)
-#         mvn_k = torch.distributions.MultivariateNormal(loc=mu[k], covariance_matrix=cov_full)
-#         z = mvn_k.sample((S_latent,))                    # (S,D)
-#         z2 = z @ P_2d                                    # (S,2)
-#         _contour_plot(ax_lat, z2, title="Latent (2D KDE)", gridsize=gridsize)
-
-#         # (5) after g_B contour（对 ε 做 PCA->2D 再 KDE）
-#         ax_eps = fig.add_subplot(gs[1, 2])
-#         if use_decoder:
-#             eps_flat = _latent_to_eps(
-#                 z, use_decoder=True, decoder=encoder if hasattr(encoder, "__call__") and encoder is not None and False else head,  # 占位不会用到
-#                 C=C, H=H, W=W, gamma=gamma, norm_type=norm_type, g_ball_fn=g_ball_fn
-#             )
-#             # 上面那行只是满足签名占位，不会调用 head；真正应当使用你的 decoder/g_ball_fn：
-#         else:
-#             # 无 decoder：直接把 z 当作 u，再投影到球得到 eps
-#             if g_ball_fn is None:
-#                 raise ValueError("未使用 decoder 时也请提供 g_ball_fn 以投影到 L_p 球。")
-#             eps_flat = _latent_to_eps(z, use_decoder=False, decoder=None,
-#                                       C=1, H=1, W=D, gamma=gamma, norm_type=norm_type, g_ball_fn=g_ball_fn)
-
-#         # 对 eps_flat 做 2D PCA
-#         X = eps_flat - eps_flat.mean(0, keepdim=True)
-#         U, S, Vt = torch.linalg.svd(X, full_matrices=False)
-#         P2_eps = Vt[:2, :] if X.shape[1] >= 2 else torch.eye(1, device=X.device)
-#         Y2 = X @ P2_eps.T if X.shape[1] >= 2 else torch.cat([X, torch.zeros(X.size(0),1,device=X.device)], dim=1)
-#         _contour_plot(ax_eps, Y2[:, :2], title="After g_B (2D KDE)", gridsize=gridsize)
-
-#         # 右下角空出来放额外说明
-#         ax_txt = fig.add_subplot(gs[1, 3])
-#         ax_txt.axis("off")
-#         ax_txt.text(0.0, 0.9, f"Component k = {k}", fontsize=11)
-#         ax_txt.text(0.0, 0.7, f"D = {D}, d = {d}", fontsize=10)
-#         ax_txt.text(0.0, 0.55, f"S_latent = {S_latent}", fontsize=10)
-#         ax_txt.text(0.0, 0.4, f"norm = {norm_type}, gamma = {gamma}", fontsize=10)
-
-#         fig.suptitle(f"GMM component #{k}", y=0.98)
-#         plt.show()
-
-#         if save_dir is not None:
-#             path = os.path.join(save_dir, f"gmm_component_{k:02d}.png")
-#             fig.savefig(path, bbox_inches="tight")
-#             print(f"[viz] saved -> {path}")
