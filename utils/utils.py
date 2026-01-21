@@ -313,7 +313,7 @@ def compute_pr_on_clean_correct(
                 chunk_size=chunk_size
             )
 
-            # Accumulate per-image PR (CORRECT weighting!)
+            # Accumulate per-image PR 
             # per_image_pr is shape [n], so sum gives total PR contribution
             pr_sum += per_image_pr.sum().item()
             total_used += n
