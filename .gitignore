@@ -2,9 +2,4 @@
 # Those are large files which is not needed to be tracked by git
 
 dataset/*
-log/*
-model_zoo/*
-tmp/*
 ckp/*
-logs/*
-ar_and_pr/*
